@@ -38,9 +38,8 @@ impl TunDevice {
 
 #[cfg(target_os = "linux")]
 pub fn create_tun(name: &str, ip_cidr: &str) -> io::Result<TunDevice> {
-    use std::os::unix::io::{FromRawFd, AsRawFd};
+    use std::os::unix::io::AsRawFd;
     use std::fs::OpenOptions;
-    use std::os::unix::fs::OpenOptionsExt;
     use std::process::Command;
 
     const IFF_TUN: i16 = 0x0001;

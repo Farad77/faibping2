@@ -74,11 +74,34 @@ fi
 
 echo "[*] Building accelerator-server release binary..."
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ACCEL_ROOT="${SCRIPT_DIR}/../.."
-cd "${ACCEL_ROOT}"
+
+# Find workspace root containing Cargo.toml
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+if [[ ! -f "${REPO_ROOT}/Cargo.toml" ]]; then
+    REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+fi
+
+echo "[*] Workspace root detected at: ${REPO_ROOT}"
+cd "${REPO_ROOT}"
 cargo build --release -p accelerator-server
 
-cp "${ACCEL_ROOT}/target/release/accelerator-server" /usr/local/bin/gametunnel-server
+# Locate compiled binary dynamically
+BIN_SRC=""
+if [[ -f "${REPO_ROOT}/target/release/accelerator-server" ]]; then
+    BIN_SRC="${REPO_ROOT}/target/release/accelerator-server"
+elif [[ -f "${SCRIPT_DIR}/../../target/release/accelerator-server" ]]; then
+    BIN_SRC="${SCRIPT_DIR}/../../target/release/accelerator-server"
+else
+    BIN_SRC=$(find "${REPO_ROOT}" -type f -name "accelerator-server" | grep -v "\.d" | head -n 1)
+fi
+
+if [[ -z "${BIN_SRC}" || ! -f "${BIN_SRC}" ]]; then
+    echo "[!] Error: accelerator-server binary could not be found after compilation."
+    exit 1
+fi
+
+echo "[*] Installing binary from ${BIN_SRC} to /usr/local/bin/gametunnel-server..."
+cp "${BIN_SRC}" /usr/local/bin/gametunnel-server
 chmod +x /usr/local/bin/gametunnel-server
 
 # 6. Systemd service creation
