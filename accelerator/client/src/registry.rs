@@ -31,6 +31,20 @@ impl RegistryOptimizer {
         Self::default()
     }
 
+    pub fn is_admin() -> bool {
+        #[cfg(windows)]
+        {
+            use winreg::enums::*;
+            use winreg::RegKey;
+            let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+            hklm.open_subkey_with_flags(r"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters", KEY_WRITE).is_ok()
+        }
+        #[cfg(not(windows))]
+        {
+            true
+        }
+    }
+
     #[cfg(windows)]
     pub fn apply_optimizations(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         use winreg::enums::*;

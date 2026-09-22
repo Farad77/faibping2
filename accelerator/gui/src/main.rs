@@ -18,7 +18,6 @@ use tracing::{error, info};
 mod web_ui;
 
 use accelerator_client::config::GameProfile;
-use accelerator_client::fastconnect::FastConnectEngine;
 use accelerator_client::intercept::{InterceptedPacket, InterceptionEngine};
 use accelerator_client::registry::RegistryOptimizer;
 use accelerator_client::settings::AppSettings;
@@ -28,6 +27,7 @@ use accelerator_client::watcher::ProcessWatcher;
 #[derive(Default, Clone)]
 struct GuiState {
     running: bool,
+    is_admin: bool,
     vps_host: String,
     vps_ch1: u16,
     vps_ch2: u16,
@@ -64,8 +64,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let settings = Arc::new(Mutex::new(AppSettings::load_or_default("settings.json")));
     let initial_settings = settings.lock().await.clone();
 
+    let is_admin = RegistryOptimizer::is_admin();
     let state = Arc::new(Mutex::new(GuiState {
         running: false,
+        is_admin,
         vps_host: initial_settings.vps_host.clone(),
         vps_ch1: initial_settings.vps_ch1,
         vps_ch2: initial_settings.vps_ch2,
@@ -147,6 +149,7 @@ async fn handle_http_request(
         let s = state.lock().await;
         let json = serde_json::json!({
             "running": s.running,
+            "is_admin": s.is_admin,
             "vps_host": s.vps_host,
             "game_name": s.game_name,
             "game_detected": s.game_detected,
@@ -275,8 +278,18 @@ async fn run_engine_worker(state: Arc<Mutex<GuiState>>, stop_signal: Arc<AtomicB
         }
     };
 
+    // Initialize Channels
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<InterceptedPacket>(4096);
+    let (in_tx, in_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
+
     // Bind Transport
-    let transport = match MultipathTransport::bind(addr_ch1, addr_ch2, profile.optimizations.dscp_tag).await {
+    let transport = match MultipathTransport::bind(
+        addr_ch1,
+        addr_ch2,
+        profile.optimizations.dscp_tag,
+        in_tx,
+    )
+    .await {
         Ok(t) => Arc::new(t),
         Err(e) => {
             error!("Transport bind error: {}", e);
@@ -291,13 +304,7 @@ async fn run_engine_worker(state: Arc<Mutex<GuiState>>, stop_signal: Arc<AtomicB
     let watcher_rx = watcher.subscribe();
     watcher.start().await;
 
-    // FastConnect Engine
-    let fastconnect = FastConnectEngine::new(profile.optimizations.enable_fastconnect);
-
-    // Interception Engine
-    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<InterceptedPacket>(4096);
-    let (_in_tx, in_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4096);
-
+    // Interception Engine (FastConnect local ACK injection is executed internally)
     let interceptor = InterceptionEngine::new(profile.clone(), watcher_rx.clone(), out_tx, in_rx);
     interceptor.start().await;
 
@@ -305,36 +312,33 @@ async fn run_engine_worker(state: Arc<Mutex<GuiState>>, stop_signal: Arc<AtomicB
     let fwd_transport = transport_tx.clone();
     tokio::spawn(async move {
         while let Some(packet) = out_rx.recv().await {
-            if packet.is_tcp && fastconnect.is_enabled() {
-                let _ = fastconnect.synthesize_local_ack(&packet.raw);
-            }
             let _ = fwd_transport.send(packet.raw).await;
         }
     });
 
-    // Telemetry Sync Loop with UI State
+    // Telemetry Sync Loop with UI State (Real Live Metrics from VPS)
     let mut ticker = tokio::time::interval(Duration::from_millis(500));
     while !stop_signal.load(Ordering::Relaxed) {
         ticker.tick().await;
         let proc = watcher_rx.borrow().clone();
+        let (rtt1, jit1, tx1, prb1, ack1, rtt2, jit2, tx2, prb2, ack2) = transport.get_metrics().await;
 
         let mut s = state.lock().await;
         s.game_detected = proc.is_running;
         s.pids = proc.pids;
         s.tracked_ports_count = proc.tracked_ports.len();
 
-        // Synthetic telemetry updates for real-time dashboard responsiveness
-        if s.path1_rtt == 0.0 {
-            s.path1_rtt = 228.4;
-            s.path2_rtt = 231.2;
-            s.path1_jitter = 2.1;
-            s.path2_jitter = 2.8;
-        }
-        s.path1_tx += 15;
-        s.path2_tx += 15;
-        s.path1_probes += 1;
-        s.path2_probes += 1;
-        s.path1_acked += 1;
+        s.path1_rtt = rtt1;
+        s.path1_jitter = jit1;
+        s.path1_tx = tx1;
+        s.path1_probes = prb1;
+        s.path1_acked = ack1;
+
+        s.path2_rtt = rtt2;
+        s.path2_jitter = jit2;
+        s.path2_tx = tx2;
+        s.path2_probes = prb2;
+        s.path2_acked = ack2;
     }
 
     info!("[Engine] Stopping FastPing engine and restoring registry...");

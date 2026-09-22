@@ -284,6 +284,15 @@ pub const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
   </header>
 
   <main>
+    <!-- Admin Warning Banner -->
+    <div id="admin-warning" style="display: none; background: rgba(255, 51, 102, 0.15); border: 1px solid var(--danger); color: #ff99aa; padding: 14px 20px; border-radius: 12px; font-size: 13px; font-weight: 600; align-items: center; gap: 12px; box-shadow: 0 4px 16px var(--danger-glow);">
+      <span style="font-size: 22px;">⚠️</span>
+      <div>
+        <div style="color: #fff; font-size: 14px; margin-bottom: 2px;">PRIVILÈGES ADMINISTRATEUR REQUIS</div>
+        L'interception de paquets noyau (WinDivert) et les réglages du Registre nécessitent les droits administrateur. Relancez via <b style="color: #fff;">Lancer-FastPing.bat</b> ou faites un clic droit &rarr; <i>"Exécuter en tant qu'administrateur"</i>.
+      </div>
+    </div>
+
     <!-- Hero Toggle Card -->
     <div class="hero-card">
       <div class="game-info">
@@ -395,6 +404,14 @@ pub const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
         const data = await res.json();
 
         isRunning = data.running;
+
+        const adminWarning = document.getElementById('admin-warning');
+        if (data.is_admin === false) {
+          adminWarning.style.display = 'flex';
+        } else {
+          adminWarning.style.display = 'none';
+        }
+
         const statusDot = document.getElementById('status-dot');
         const statusText = document.getElementById('status-text');
         const btnToggle = document.getElementById('btn-toggle');

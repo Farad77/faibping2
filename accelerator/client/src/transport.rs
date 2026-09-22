@@ -14,6 +14,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex};
 use tracing::info;
 
+use accelerator_common::deduplicator::Deduplicator;
 use accelerator_common::protocol::{GameTunnelHeader, HEADER_LEN};
 
 pub struct TransportMetrics {
@@ -46,6 +47,8 @@ pub struct MultipathTransport {
     metrics_ch2: Arc<Mutex<TransportMetrics>>,
     packet_tx: mpsc::Sender<Vec<u8>>,
     packet_rx: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
+    inbound_tx: mpsc::Sender<Vec<u8>>,
+    dedup: Arc<Mutex<Deduplicator>>,
 }
 
 #[inline]
@@ -61,6 +64,7 @@ impl MultipathTransport {
         remote_ch1: SocketAddr,
         remote_ch2: SocketAddr,
         dscp_tag: u8,
+        inbound_tx: mpsc::Sender<Vec<u8>>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let sock1 = UdpSocket::bind("0.0.0.0:0").await?;
         let sock2 = UdpSocket::bind("0.0.0.0:0").await?;
@@ -107,11 +111,22 @@ impl MultipathTransport {
             metrics_ch2: Arc::new(Mutex::new(TransportMetrics::default())),
             packet_tx,
             packet_rx: Arc::new(Mutex::new(packet_rx)),
+            inbound_tx,
+            dedup: Arc::new(Mutex::new(Deduplicator::new())),
         })
     }
 
     pub fn packet_sender(&self) -> mpsc::Sender<Vec<u8>> {
         self.packet_tx.clone()
+    }
+
+    pub async fn get_metrics(&self) -> (f64, f64, u64, u64, u64, f64, f64, u64, u64, u64) {
+        let m1 = self.metrics_ch1.lock().await;
+        let m2 = self.metrics_ch2.lock().await;
+        (
+            m1.rtt_ms, m1.jitter_ms, m1.packets_sent, m1.probes_sent, m1.probes_acked,
+            m2.rtt_ms, m2.jitter_ms, m2.packets_sent, m2.probes_sent, m2.probes_acked,
+        )
     }
 
     pub async fn start(&self) {
@@ -138,12 +153,16 @@ impl MultipathTransport {
                 let h1 = GameTunnelHeader::new(s, ts, false, false);
                 let _ = h1.encode(&mut buf_ch1);
                 let len = HEADER_LEN + raw_packet.len();
-                buf_ch1[HEADER_LEN..len].copy_from_slice(&raw_packet);
+                if len <= buf_ch1.len() {
+                    buf_ch1[HEADER_LEN..len].copy_from_slice(&raw_packet);
+                }
 
                 // Build Duplicated Packet (IS_DUP = 1)
                 let h2 = GameTunnelHeader::new(s, ts, true, false);
                 let _ = h2.encode(&mut buf_ch2);
-                buf_ch2[HEADER_LEN..len].copy_from_slice(&raw_packet);
+                if len <= buf_ch2.len() {
+                    buf_ch2[HEADER_LEN..len].copy_from_slice(&raw_packet);
+                }
 
                 // Send concurrently on both paths
                 let _ = sock1.send_to(&buf_ch1[..len], dest1).await;
@@ -187,36 +206,58 @@ impl MultipathTransport {
             }
         });
 
-        // Task: Listen for Probe ACKs on Path 1
+        // Task: Listen on Path 1 (Probe ACKs + Downlink Game Packets)
         let a_sock1 = Arc::clone(&self.sock_ch1);
         let a_metrics1 = Arc::clone(&self.metrics_ch1);
+        let dedup1 = Arc::clone(&self.dedup);
+        let in_tx1 = self.inbound_tx.clone();
+
         tokio::spawn(async move {
-            let mut buf = [0u8; HEADER_LEN];
+            let mut buf = vec![0u8; 65535];
             while let Ok((len, _)) = a_sock1.recv_from(&mut buf).await {
                 if len >= HEADER_LEN {
-                    if let Ok(h) = GameTunnelHeader::decode(&buf) {
+                    if let Ok(h) = GameTunnelHeader::decode(&buf[..len]) {
                         if h.is_ack() {
                             let now = current_time_ms();
                             let sample_rtt = now.saturating_sub(h.timestamp) as f64;
                             update_telemetry(&a_metrics1, sample_rtt).await;
+                        } else if len > HEADER_LEN {
+                            let mut d = dedup1.lock().await;
+                            let accepted = d.process_packet(h.sequence);
+                            drop(d);
+                            if accepted {
+                                let payload = buf[HEADER_LEN..len].to_vec();
+                                let _ = in_tx1.send(payload).await;
+                            }
                         }
                     }
                 }
             }
         });
 
-        // Task: Listen for Probe ACKs on Path 2
+        // Task: Listen on Path 2 (Probe ACKs + Downlink Game Packets)
         let a_sock2 = Arc::clone(&self.sock_ch2);
         let a_metrics2 = Arc::clone(&self.metrics_ch2);
+        let dedup2 = Arc::clone(&self.dedup);
+        let in_tx2 = self.inbound_tx.clone();
+
         tokio::spawn(async move {
-            let mut buf = [0u8; HEADER_LEN];
+            let mut buf = vec![0u8; 65535];
             while let Ok((len, _)) = a_sock2.recv_from(&mut buf).await {
                 if len >= HEADER_LEN {
-                    if let Ok(h) = GameTunnelHeader::decode(&buf) {
+                    if let Ok(h) = GameTunnelHeader::decode(&buf[..len]) {
                         if h.is_ack() {
                             let now = current_time_ms();
                             let sample_rtt = now.saturating_sub(h.timestamp) as f64;
                             update_telemetry(&a_metrics2, sample_rtt).await;
+                        } else if len > HEADER_LEN {
+                            let mut d = dedup2.lock().await;
+                            let accepted = d.process_packet(h.sequence);
+                            drop(d);
+                            if accepted {
+                                let payload = buf[HEADER_LEN..len].to_vec();
+                                let _ = in_tx2.send(payload).await;
+                            }
                         }
                     }
                 }

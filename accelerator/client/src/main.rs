@@ -7,7 +7,6 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use accelerator_client::config::{self, GameProfile};
-use accelerator_client::fastconnect::FastConnectEngine;
 use accelerator_client::intercept::{InterceptedPacket, InterceptionEngine};
 use accelerator_client::registry::RegistryOptimizer;
 use accelerator_client::settings::AppSettings;
@@ -93,12 +92,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Multipath Dup  : {}", profile.optimizations.enable_multipath_dup);
     info!("DSCP Tag       : {}", profile.optimizations.dscp_tag);
 
-    // 2. Windows Registry Low-Latency Tuning
+    // 2. Windows Registry Low-Latency Tuning & Admin Check
+    let is_admin = RegistryOptimizer::is_admin();
+    if !is_admin {
+        warn!("====================================================================");
+        warn!("[!] ATTENTION: FASTPING N'A PAS LES PRIVILEGES ADMINISTRATEUR !");
+        warn!("[!] L'interception noyau WinDivert et le registre exigent le mode Admin.");
+        warn!("[!] Veuillez relancer FastPing en tant qu'Administrateur !");
+        warn!("====================================================================");
+    }
+
     let mut registry_opt = RegistryOptimizer::new();
-    if !args.no_registry {
+    if !args.no_registry && is_admin {
         if let Err(e) = registry_opt.apply_optimizations() {
             warn!("[Registry] Failed to apply registry tweaks: {}", e);
         }
+    } else if !is_admin {
+        info!("[Registry] Bypassing registry optimizations (insufficient privileges).");
     } else {
         info!("[Registry] Bypassing registry optimizations (--no-registry).");
     }
@@ -113,28 +123,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .next()
         .ok_or("Failed to resolve VPS Channel 2 address")?;
 
-    // 4. Initialize Multipath Transport
+    // 4. Initialize Channels
+    let (outbound_tx, mut outbound_rx) = mpsc::channel::<InterceptedPacket>(4096);
+    let (inbound_tx, inbound_rx) = mpsc::channel::<Vec<u8>>(4096);
+
+    // 5. Initialize Multipath Transport
     let transport = MultipathTransport::bind(
         addr_ch1,
         addr_ch2,
         profile.optimizations.dscp_tag,
+        inbound_tx,
     )
     .await?;
     transport.start().await;
     let transport_sender = transport.packet_sender();
 
-    // 5. Initialize Process Watcher
+    // 6. Initialize Process Watcher
     let watcher = ProcessWatcher::new(profile.clone());
     let process_state_rx = watcher.subscribe();
     watcher.start().await;
 
-    // 6. Initialize FastConnect Engine
-    let fastconnect = FastConnectEngine::new(profile.optimizations.enable_fastconnect);
-
     // 7. Initialize WinDivert Interception Engine
-    let (outbound_tx, mut outbound_rx) = mpsc::channel::<InterceptedPacket>(4096);
-    let (_inbound_tx, inbound_rx) = mpsc::channel::<Vec<u8>>(4096);
-
     let interceptor = InterceptionEngine::new(
         profile.clone(),
         process_state_rx.clone(),
@@ -147,14 +156,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let fwd_transport = transport_sender.clone();
     tokio::spawn(async move {
         while let Some(packet) = outbound_rx.recv().await {
-            // If TCP data and FastConnect enabled, synthesize local immediate ACK
-            if packet.is_tcp && fastconnect.is_enabled() {
-                if let Some(_ack) = fastconnect.synthesize_local_ack(&packet.raw) {
-                    // Local ACK synthesized to unlock client animation
-                }
-            }
-
-            // Relay payload packet over GameTunnel overlay
             let _ = fwd_transport.send(packet.raw).await;
         }
     });

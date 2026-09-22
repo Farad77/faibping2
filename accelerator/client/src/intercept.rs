@@ -10,6 +10,7 @@ use tokio::sync::{mpsc, watch, Mutex};
 use tracing::{info, warn, error};
 
 use crate::config::GameProfile;
+use crate::fastconnect::FastConnectEngine;
 use crate::watcher::ProcessState;
 
 pub struct InterceptedPacket {
@@ -136,6 +137,37 @@ fn run_divert_loop(
 
             info!("[WinDivert] Kernel packet capture active.");
 
+            let fastconnect = FastConnectEngine::new(profile.optimizations.enable_fastconnect);
+
+            // Spawn background thread to inject returning packets from VPS into Windows
+            let inbound_handle_raw = handle as usize;
+            let inbound_send_raw = send_fn as usize;
+            let inbound_rx_clone = Arc::clone(&_inbound_rx);
+            std::thread::spawn(move || {
+                let inbound_handle = inbound_handle_raw as *mut std::ffi::c_void;
+                let inbound_send: WinDivertSendFn = std::mem::transmute(inbound_send_raw);
+                let mut write_len = 0u32;
+                let mut inbound_addr = [0u8; 64];
+                inbound_addr[16] = 1; // WINDIVERT_DIRECTION_INBOUND = 1
+                loop {
+                    let pkt_opt = {
+                        let mut rx = inbound_rx_clone.blocking_lock();
+                        rx.blocking_recv()
+                    };
+                    if let Some(pkt) = pkt_opt {
+                        inbound_send(
+                            inbound_handle,
+                            pkt.as_ptr(),
+                            pkt.len() as u32,
+                            inbound_addr.as_ptr(),
+                            &mut write_len,
+                        );
+                    } else {
+                        break;
+                    }
+                }
+            });
+
             let mut packet_buf = vec![0u8; 65535];
             let mut addr_buf = [0u8; 64];
             let mut read_len = 0u32;
@@ -160,7 +192,23 @@ fn run_divert_loop(
                         || (state.is_running && profile.matches_port(dst_port));
 
                     if matches_game {
-                        // Game packet: forward to GameTunnel overlay
+                        // 1. FastConnect: Synthesize and immediately inject local TCP ACK into Windows stack
+                        if is_tcp && fastconnect.is_enabled() {
+                            if let Some(ack_packet) = fastconnect.synthesize_local_ack(packet) {
+                                let mut ack_addr = addr_buf;
+                                ack_addr[16] = 1; // Inbound direction
+                                let mut write_ack_len = 0u32;
+                                send_fn(
+                                    handle,
+                                    ack_packet.as_ptr(),
+                                    ack_packet.len() as u32,
+                                    ack_addr.as_ptr(),
+                                    &mut write_ack_len,
+                                );
+                            }
+                        }
+
+                        // 2. Forward original game packet to GameTunnel overlay
                         let intercepted = InterceptedPacket {
                             raw: packet.to_vec(),
                             is_tcp,
