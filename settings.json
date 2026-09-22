@@ -1,0 +1,8 @@
+{
+  "vps_host": "72.61.111.131",
+  "vps_ch1": 51820,
+  "vps_ch2": 4433,
+  "active_profile": "profiles/farever.json",
+  "enable_registry_tuning": true,
+  "auto_connect": false
+}

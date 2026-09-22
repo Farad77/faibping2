@@ -3,5 +3,6 @@ members = [
     "accelerator/common",
     "accelerator/client",
     "accelerator/server",
+    "accelerator/gui",
 ]
 resolver = "2"

@@ -6,19 +6,13 @@ use clap::Parser;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-mod config;
-mod fastconnect;
-mod intercept;
-mod registry;
-mod transport;
-mod watcher;
-
-use config::GameProfile;
-use fastconnect::FastConnectEngine;
-use intercept::{InterceptedPacket, InterceptionEngine};
-use registry::RegistryOptimizer;
-use transport::MultipathTransport;
-use watcher::ProcessWatcher;
+use accelerator_client::config::{self, GameProfile};
+use accelerator_client::fastconnect::FastConnectEngine;
+use accelerator_client::intercept::{InterceptedPacket, InterceptionEngine};
+use accelerator_client::registry::RegistryOptimizer;
+use accelerator_client::settings::AppSettings;
+use accelerator_client::transport::MultipathTransport;
+use accelerator_client::watcher::ProcessWatcher;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -27,25 +21,25 @@ use watcher::ProcessWatcher;
     about = "FastPing MMO Low-Latency WAN Accelerator Client (Target: Windows & Aion 2)"
 )]
 struct Args {
-    /// Path to game profile JSON file
-    #[arg(short, long, default_value = "profiles/aion2.json")]
-    profile: PathBuf,
+    /// Path to game profile JSON file (defaults to settings.json)
+    #[arg(short, long)]
+    profile: Option<PathBuf>,
 
     /// Scan directory to auto-detect game executable (e.g. C:\Games\Aion2)
     #[arg(long)]
     scan_dir: Option<PathBuf>,
 
-    /// VPS Gateway Host / IP
-    #[arg(long, default_value = "127.0.0.1")]
-    vps_host: String,
+    /// VPS Gateway Host / IP (defaults to settings.json: 72.61.111.131)
+    #[arg(long)]
+    vps_host: Option<String>,
 
     /// VPS UDP Channel 1 Port
-    #[arg(long, default_value_t = 51820)]
-    vps_ch1: u16,
+    #[arg(long)]
+    vps_ch1: Option<u16>,
 
     /// VPS UDP Channel 2 Port
-    #[arg(long, default_value_t = 4433)]
-    vps_ch2: u16,
+    #[arg(long)]
+    vps_ch2: Option<u16>,
 
     /// Skip Windows TCP/IP registry tuning (useful for non-admin testing)
     #[arg(long)]
@@ -62,9 +56,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let args = Args::parse();
+    let settings = AppSettings::load_or_default("settings.json");
+
+    let vps_host = args.vps_host.unwrap_or_else(|| settings.vps_host.clone());
+    let vps_ch1 = args.vps_ch1.unwrap_or(settings.vps_ch1);
+    let vps_ch2 = args.vps_ch2.unwrap_or(settings.vps_ch2);
+    let profile_path = args.profile.unwrap_or_else(|| PathBuf::from(&settings.active_profile));
 
     info!("============================================================");
     info!("Starting FastPing WAN Accelerator Client");
+    info!("VPS Endpoint   : {}:{} & :{}", vps_host, vps_ch1, vps_ch2);
     info!("============================================================");
 
     // 1. Resolve Game Profile (Declarative or Auto-detection)
@@ -78,12 +79,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 p
             }
             None => {
-                warn!("No known game found in scan directory. Falling back to default profile: {:?}", args.profile);
-                load_or_fallback_profile(&args.profile)?
+                warn!("No known game found in scan directory. Falling back to profile: {:?}", profile_path);
+                load_or_fallback_profile(&profile_path)?
             }
         }
     } else {
-        load_or_fallback_profile(&args.profile)?
+        load_or_fallback_profile(&profile_path)?
     };
 
     info!("Active Profile : {} [{}]", profile.name, profile.game_id);
@@ -103,11 +104,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 3. Resolve Remote VPS Endpoints
-    let addr_ch1: SocketAddr = format!("{}:{}", args.vps_host, args.vps_ch1)
+    let addr_ch1: SocketAddr = format!("{}:{}", vps_host, vps_ch1)
         .to_socket_addrs()?
         .next()
         .ok_or("Failed to resolve VPS Channel 1 address")?;
-    let addr_ch2: SocketAddr = format!("{}:{}", args.vps_host, args.vps_ch2)
+    let addr_ch2: SocketAddr = format!("{}:{}", vps_host, vps_ch2)
         .to_socket_addrs()?
         .next()
         .ok_or("Failed to resolve VPS Channel 2 address")?;
