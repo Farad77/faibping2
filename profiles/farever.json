@@ -1,0 +1,19 @@
+{
+  "game_id": "farever",
+  "name": "Farever",
+  "executables": [
+    "Farever.exe",
+    "farever.exe"
+  ],
+  "routing": {
+    "protocol": "TCP",
+    "ports": [6022, 60442, "6000-7000", "60000-65535"],
+    "target_subnets": ["0.0.0.0/0"]
+  },
+  "optimizations": {
+    "enable_fastconnect": true,
+    "enable_multipath_dup": true,
+    "packet_duplication_rate": 2,
+    "dscp_tag": 46
+  }
+}
