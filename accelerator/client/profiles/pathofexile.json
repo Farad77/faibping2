@@ -1,0 +1,29 @@
+{
+  "game_id": "pathofexile",
+  "name": "Path of Exile",
+  "executables": [
+    "PathOfExile.exe",
+    "PathOfExile_x64.exe",
+    "PathOfExileSteam.exe",
+    "PathOfExile_x64Steam.exe",
+    "PathOfExileEGS.exe",
+    "PathOfExile_x64EGS.exe",
+    "PathOfExile_KG.exe",
+    "PathOfExile_x64_KG.exe",
+    "PathOfExile2.exe",
+    "PathOfExile2_x64.exe",
+    "PathOfExile2Steam.exe",
+    "PathOfExile2_x64Steam.exe"
+  ],
+  "routing": {
+    "protocol": "TCP",
+    "ports": [6112, 12995, 20481, 20499, "6000-7000", "12000-13500", "20400-20600", "32000-34000"],
+    "target_subnets": ["0.0.0.0/0"]
+  },
+  "optimizations": {
+    "enable_fastconnect": true,
+    "enable_multipath_dup": true,
+    "packet_duplication_rate": 2,
+    "dscp_tag": 46
+  }
+}

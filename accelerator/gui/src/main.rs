@@ -63,6 +63,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let settings = Arc::new(Mutex::new(AppSettings::load_or_default("settings.json")));
     let initial_settings = settings.lock().await.clone();
+    let initial_game_name = GameProfile::load_from_file(&initial_settings.active_profile)
+        .map(|p| p.name)
+        .unwrap_or_else(|_| "Path of Exile".to_string());
 
     let is_admin = RegistryOptimizer::is_admin();
     let state = Arc::new(Mutex::new(GuiState {
@@ -72,7 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         vps_ch1: initial_settings.vps_ch1,
         vps_ch2: initial_settings.vps_ch2,
         active_profile_path: initial_settings.active_profile.clone(),
-        game_name: "Farever (MMO)".to_string(),
+        game_name: initial_game_name,
         ..Default::default()
     }));
 
@@ -151,6 +154,7 @@ async fn handle_http_request(
             "running": s.running,
             "is_admin": s.is_admin,
             "vps_host": s.vps_host,
+            "active_profile": s.active_profile_path,
             "game_name": s.game_name,
             "game_detected": s.game_detected,
             "pids": s.pids,
@@ -168,6 +172,29 @@ async fn handle_http_request(
         })
         .to_string();
 
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            json.len(),
+            json
+        );
+        let _ = socket.write_all(resp.as_bytes()).await;
+    } else if method == "GET" && path == "/api/profiles" {
+        let mut profiles_list = Vec::new();
+        if let Ok(entries) = std::fs::read_dir("profiles") {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.extension().and_then(|e| e.to_str()) == Some("json") {
+                    if let Ok(prof) = GameProfile::load_from_file(&p) {
+                        profiles_list.push(serde_json::json!({
+                            "path": p.to_string_lossy().replace('\\', "/"),
+                            "id": prof.game_id,
+                            "name": prof.name,
+                        }));
+                    }
+                }
+            }
+        }
+        let json = serde_json::to_string(&profiles_list).unwrap_or_else(|_| "[]".into());
         let resp = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             json.len(),
@@ -210,6 +237,9 @@ async fn handle_http_request(
                 let mut s = state.lock().await;
                 s.vps_host = sett.vps_host.clone();
                 s.active_profile_path = sett.active_profile.clone();
+                if let Ok(p) = GameProfile::load_from_file(&sett.active_profile) {
+                    s.game_name = p.name;
+                }
             }
         }
         let resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK";

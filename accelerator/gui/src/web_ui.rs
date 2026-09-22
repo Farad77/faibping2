@@ -378,8 +378,9 @@ pub const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
         <div class="card-title">Configuration de la Passerelle VPS</div>
         <div class="form-group">
           <label>Profil de Jeu Actif</label>
-          <select id="setting-profile" class="form-select">
-            <option value="profiles/farever.json">Farever (MMO en cours)</option>
+          <select id="setting-profile" class="form-select" onchange="onProfileSelectChange()">
+            <option value="profiles/pathofexile.json">Path of Exile (ARPG / Lockstep)</option>
+            <option value="profiles/farever.json">Farever (MMO)</option>
             <option value="profiles/aion2.json">Aion 2 (MMORPG)</option>
             <option value="profiles/mock_game.json">Mock Game (Harnais de test)</option>
           </select>
@@ -388,15 +389,46 @@ pub const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
           <label>Adresse IP du VPS Linux</label>
           <input id="setting-vps-ip" class="form-input" type="text" value="72.61.111.131" placeholder="ex: 72.61.111.131">
         </div>
-        <button class="btn-save" onclick="saveSettings()">💾 Sauvegarder les Paramètres</button>
+        <button class="btn-save" onclick="saveSettings(true)">💾 Sauvegarder les Paramètres</button>
       </div>
     </div>
   </main>
 
   <script>
     let isRunning = false;
+    let profilesLoaded = false;
     const history1 = new Array(50).fill(0);
     const history2 = new Array(50).fill(0);
+
+    async function loadProfiles(activeProfile) {
+      if (profilesLoaded) return;
+      try {
+        const res = await fetch('/api/profiles');
+        if (res.ok) {
+          const list = await res.json();
+          if (list && list.length > 0) {
+            const sel = document.getElementById('setting-profile');
+            sel.innerHTML = '';
+            for (const p of list) {
+              const opt = document.createElement('option');
+              opt.value = p.path;
+              opt.innerText = p.name;
+              if (activeProfile && (p.path === activeProfile || p.path.endsWith(activeProfile))) {
+                opt.selected = true;
+              }
+              sel.appendChild(opt);
+            }
+            profilesLoaded = true;
+          }
+        }
+      } catch (e) {
+        console.error("Failed to load profiles:", e);
+      }
+    }
+
+    async function onProfileSelectChange() {
+      await saveSettings(false);
+    }
 
     async function pollStatus() {
       try {
@@ -436,6 +468,23 @@ pub const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
         const heroName = document.getElementById('hero-game-name');
         const heroBadge = document.getElementById('hero-game-badge');
         heroName.innerText = data.game_name || 'Jeu non détecté';
+
+        if (!profilesLoaded && data.active_profile) {
+          loadProfiles(data.active_profile);
+          const sel = document.getElementById('setting-profile');
+          for (let i = 0; i < sel.options.length; i++) {
+            if (sel.options[i].value === data.active_profile || sel.options[i].value.endsWith(data.active_profile)) {
+              sel.selectedIndex = i;
+              break;
+            }
+          }
+        }
+        if (data.vps_host) {
+          const ipInput = document.getElementById('setting-vps-ip');
+          if (document.activeElement !== ipInput && !ipInput.value) {
+            ipInput.value = data.vps_host;
+          }
+        }
 
         if (data.game_detected) {
           heroBadge.style.color = 'var(--accent)';
@@ -481,7 +530,7 @@ pub const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
       }
     }
 
-    async function saveSettings() {
+    async function saveSettings(showToast = true) {
       const vps_host = document.getElementById('setting-vps-ip').value.trim();
       const active_profile = document.getElementById('setting-profile').value;
 
@@ -492,10 +541,13 @@ pub const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
           body: JSON.stringify({ vps_host, active_profile })
         });
         if (res.ok) {
-          alert("Paramètres sauvegardés avec succès dans settings.json !");
+          if (showToast) {
+            alert("Paramètres sauvegardés avec succès !");
+          }
+          pollStatus();
         }
       } catch (e) {
-        alert("Erreur de sauvegarde: " + e);
+        if (showToast) alert("Erreur de sauvegarde: " + e);
       }
     }
 

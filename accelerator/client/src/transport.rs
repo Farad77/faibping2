@@ -16,7 +16,9 @@ use tracing::info;
 
 use accelerator_common::deduplicator::Deduplicator;
 use accelerator_common::protocol::{GameTunnelHeader, HEADER_LEN};
+use crate::nat::TunnelNat;
 
+#[derive(Debug, Clone, Default)]
 pub struct TransportMetrics {
     pub rtt_ms: f64,
     pub jitter_ms: f64,
@@ -25,8 +27,8 @@ pub struct TransportMetrics {
     pub probes_acked: u64,
 }
 
-impl Default for TransportMetrics {
-    fn default() -> Self {
+impl TransportMetrics {
+    pub fn new() -> Self {
         Self {
             rtt_ms: 0.0,
             jitter_ms: 0.0,
@@ -49,6 +51,7 @@ pub struct MultipathTransport {
     packet_rx: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
     inbound_tx: mpsc::Sender<Vec<u8>>,
     dedup: Arc<Mutex<Deduplicator>>,
+    nat: Arc<TunnelNat>,
 }
 
 #[inline]
@@ -113,6 +116,7 @@ impl MultipathTransport {
             packet_rx: Arc::new(Mutex::new(packet_rx)),
             inbound_tx,
             dedup: Arc::new(Mutex::new(Deduplicator::new())),
+            nat: Arc::new(TunnelNat::new([10, 8, 0, 2])),
         })
     }
 
@@ -139,13 +143,20 @@ impl MultipathTransport {
         let metrics2 = Arc::clone(&self.metrics_ch2);
         let rx = Arc::clone(&self.packet_rx);
 
+        let nat_out = Arc::clone(&self.nat);
+        let nat1 = Arc::clone(&self.nat);
+        let nat2 = Arc::clone(&self.nat);
+
         // Task: Replicate outbound packets across both paths
         tokio::spawn(async move {
             let mut buf_ch1 = vec![0u8; 65535];
             let mut buf_ch2 = vec![0u8; 65535];
             let mut rx_lock = rx.lock().await;
 
-            while let Some(raw_packet) = rx_lock.recv().await {
+            while let Some(mut raw_packet) = rx_lock.recv().await {
+                // Apply Tunnel NAT: translate local LAN IP to 10.8.0.2 with checksum recalculation
+                nat_out.translate_outbound(&mut raw_packet);
+
                 let s = seq.fetch_add(1, Ordering::Relaxed);
                 let ts = current_time_ms();
 
@@ -226,7 +237,8 @@ impl MultipathTransport {
                             let accepted = d.process_packet(h.sequence);
                             drop(d);
                             if accepted {
-                                let payload = buf[HEADER_LEN..len].to_vec();
+                                let mut payload = buf[HEADER_LEN..len].to_vec();
+                                nat1.translate_inbound(&mut payload);
                                 let _ = in_tx1.send(payload).await;
                             }
                         }
@@ -255,7 +267,8 @@ impl MultipathTransport {
                             let accepted = d.process_packet(h.sequence);
                             drop(d);
                             if accepted {
-                                let payload = buf[HEADER_LEN..len].to_vec();
+                                let mut payload = buf[HEADER_LEN..len].to_vec();
+                                nat2.translate_inbound(&mut payload);
                                 let _ = in_tx2.send(payload).await;
                             }
                         }
