@@ -5,9 +5,10 @@
 //! against the game PID's active ports table. System traffic (Discord, browser, etc.)
 //! passes through untouched.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, watch, Mutex};
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
 use crate::config::GameProfile;
 use crate::fastconnect::FastConnectEngine;
@@ -25,6 +26,7 @@ pub struct InterceptionEngine {
     process_state_rx: watch::Receiver<ProcessState>,
     outbound_tx: mpsc::Sender<InterceptedPacket>,
     inbound_rx: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
+    handle_slot: Arc<AtomicUsize>,
 }
 
 impl InterceptionEngine {
@@ -39,6 +41,35 @@ impl InterceptionEngine {
             process_state_rx,
             outbound_tx,
             inbound_rx: Arc::new(Mutex::new(inbound_rx)),
+            handle_slot: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    pub fn stop(&self) {
+        let raw = self.handle_slot.swap(0, Ordering::SeqCst);
+        if raw != 0 {
+            #[cfg(windows)]
+            {
+                use std::ffi::CString;
+                let dll_name = CString::new("WinDivert.dll").unwrap();
+                let h_module = unsafe {
+                    windows_sys::Win32::System::LibraryLoader::LoadLibraryA(dll_name.as_ptr() as *const u8)
+                };
+                if h_module != 0 {
+                    let close_sym = CString::new("WinDivertClose").unwrap();
+                    unsafe {
+                        let close_proc = windows_sys::Win32::System::LibraryLoader::GetProcAddress(
+                            h_module,
+                            close_sym.as_ptr() as *const u8,
+                        );
+                        if let Some(close_fn) = close_proc {
+                            let close_fn: unsafe extern "system" fn(handle: *mut std::ffi::c_void) -> i32 =
+                                std::mem::transmute(close_fn);
+                            close_fn(raw as *mut std::ffi::c_void);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -47,13 +78,20 @@ impl InterceptionEngine {
         let mut state_rx = self.process_state_rx.clone();
         let tx = self.outbound_tx.clone();
         let inbound_rx = Arc::clone(&self.inbound_rx);
+        let handle_slot = Arc::clone(&self.handle_slot);
 
         info!("[InterceptionEngine] Starting WinDivert filter: 'outbound and !loopback and (tcp or udp)'");
 
         // Background worker loop
         tokio::task::spawn_blocking(move || {
-            run_divert_loop(profile, &mut state_rx, tx, inbound_rx);
+            run_divert_loop(profile, &mut state_rx, tx, inbound_rx, handle_slot);
         });
+    }
+}
+
+impl Drop for InterceptionEngine {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -62,6 +100,7 @@ fn run_divert_loop(
     state_rx: &mut watch::Receiver<ProcessState>,
     outbound_tx: mpsc::Sender<InterceptedPacket>,
     _inbound_rx: Arc<Mutex<mpsc::Receiver<Vec<u8>>>>,
+    handle_slot: Arc<AtomicUsize>,
 ) {
     #[cfg(windows)]
     {
@@ -89,20 +128,22 @@ fn run_divert_loop(
             flags: u64,
         ) -> *mut std::ffi::c_void;
 
+        // WinDivertRecv: UINT *pRecvLen (4th), WINDIVERT_ADDRESS *pAddr (5th)
         type WinDivertRecvFn = unsafe extern "system" fn(
             handle: *mut std::ffi::c_void,
             p_packet: *mut u8,
             packet_len: u32,
-            p_addr: *mut u8,
             p_read_len: *mut u32,
+            p_addr: *mut u8,
         ) -> i32;
 
+        // WinDivertSend: UINT *pSendLen (4th), const WINDIVERT_ADDRESS *pAddr (5th)
         type WinDivertSendFn = unsafe extern "system" fn(
             handle: *mut std::ffi::c_void,
             p_packet: *const u8,
             packet_len: u32,
-            p_addr: *const u8,
             p_write_len: *mut u32,
+            p_addr: *const u8,
         ) -> i32;
 
         type WinDivertCloseFn = unsafe extern "system" fn(handle: *mut std::ffi::c_void) -> i32;
@@ -135,32 +176,36 @@ fn run_divert_loop(
                 return;
             }
 
+            handle_slot.store(handle as usize, Ordering::SeqCst);
             info!("[WinDivert] Kernel packet capture active.");
 
             let fastconnect = FastConnectEngine::new(profile.optimizations.enable_fastconnect);
+            let last_addr = Arc::new(std::sync::Mutex::new([0u8; 128]));
 
             // Spawn background thread to inject returning packets from VPS into Windows
             let inbound_handle_raw = handle as usize;
             let inbound_send_raw = send_fn as usize;
             let inbound_rx_clone = Arc::clone(&_inbound_rx);
+            let last_addr_inbound = Arc::clone(&last_addr);
+
             std::thread::spawn(move || {
                 let inbound_handle = inbound_handle_raw as *mut std::ffi::c_void;
                 let inbound_send: WinDivertSendFn = std::mem::transmute(inbound_send_raw);
                 let mut write_len = 0u32;
-                let mut inbound_addr = [0u8; 64];
-                inbound_addr[16] = 1; // WINDIVERT_DIRECTION_INBOUND = 1
                 loop {
                     let pkt_opt = {
                         let mut rx = inbound_rx_clone.blocking_lock();
                         rx.blocking_recv()
                     };
                     if let Some(pkt) = pkt_opt {
+                        let mut inbound_addr = *last_addr_inbound.lock().unwrap();
+                        inbound_addr[10] &= !0x02; // Set Inbound direction (clear Outbound bit 17)
                         inbound_send(
                             inbound_handle,
                             pkt.as_ptr(),
                             pkt.len() as u32,
-                            inbound_addr.as_ptr(),
                             &mut write_len,
+                            inbound_addr.as_ptr(),
                         );
                     } else {
                         break;
@@ -169,7 +214,7 @@ fn run_divert_loop(
             });
 
             let mut packet_buf = vec![0u8; 65535];
-            let mut addr_buf = [0u8; 64];
+            let mut addr_buf = [0u8; 128];
             let mut read_len = 0u32;
 
             loop {
@@ -177,13 +222,15 @@ fn run_divert_loop(
                     handle,
                     packet_buf.as_mut_ptr(),
                     packet_buf.len() as u32,
-                    addr_buf.as_mut_ptr(),
                     &mut read_len,
+                    addr_buf.as_mut_ptr(),
                 );
 
-                if ok == 0 {
+                if ok == 0 || read_len == 0 || (read_len as usize) > packet_buf.len() {
                     break;
                 }
+
+                *last_addr.lock().unwrap() = addr_buf;
 
                 let packet = &packet_buf[..read_len as usize];
                 if let Some((is_tcp, src_port, dst_port)) = parse_l4_ports(packet) {
@@ -196,14 +243,14 @@ fn run_divert_loop(
                         if is_tcp && fastconnect.is_enabled() {
                             if let Some(ack_packet) = fastconnect.synthesize_local_ack(packet) {
                                 let mut ack_addr = addr_buf;
-                                ack_addr[16] = 1; // Inbound direction
+                                ack_addr[10] &= !0x02; // Inbound direction (clear Outbound bit 17)
                                 let mut write_ack_len = 0u32;
                                 send_fn(
                                     handle,
                                     ack_packet.as_ptr(),
                                     ack_packet.len() as u32,
-                                    ack_addr.as_ptr(),
                                     &mut write_ack_len,
+                                    ack_addr.as_ptr(),
                                 );
                             }
                         }
@@ -220,16 +267,18 @@ fn run_divert_loop(
                     } else {
                         // Strict Split-Tunneling: Pass system traffic back to Windows network stack immediately!
                         let mut write_len = 0u32;
-                        send_fn(handle, packet.as_ptr(), read_len, addr_buf.as_ptr(), &mut write_len);
+                        send_fn(handle, packet.as_ptr(), read_len, &mut write_len, addr_buf.as_ptr());
                     }
                 } else {
                     // Non-TCP/UDP or unrecognized: pass through
                     let mut write_len = 0u32;
-                    send_fn(handle, packet.as_ptr(), read_len, addr_buf.as_ptr(), &mut write_len);
+                    send_fn(handle, packet.as_ptr(), read_len, &mut write_len, addr_buf.as_ptr());
                 }
             }
 
+            handle_slot.store(0, Ordering::SeqCst);
             close_fn(handle);
+            info!("[WinDivert] Divert loop terminated cleanly.");
         }
     }
 

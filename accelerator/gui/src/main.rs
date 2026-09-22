@@ -372,6 +372,7 @@ async fn run_engine_worker(state: Arc<Mutex<GuiState>>, stop_signal: Arc<AtomicB
     }
 
     info!("[Engine] Stopping FastPing engine and restoring registry...");
+    interceptor.stop();
     reg_opt.restore();
 
     {
