@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "accelerator/common",
+    "accelerator/client",
+    "accelerator/server",
+]
+resolver = "2"
