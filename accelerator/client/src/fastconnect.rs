@@ -81,10 +81,12 @@ impl FastConnectEngine {
         let ip_csum = compute_ip_checksum(&ack_packet[..20]);
         ack_packet[10..12].copy_from_slice(&ip_csum.to_be_bytes());
 
+        let server_seq = &ip_packet[tcp_offset + 8..tcp_offset + 12];
+
         // 2. TCP Header
         ack_packet[20..22].copy_from_slice(dst_port); // Source port
         ack_packet[22..24].copy_from_slice(src_port); // Dest port
-        ack_packet[24..28].copy_from_slice(&0u32.to_be_bytes()); // Sequence num
+        ack_packet[24..28].copy_from_slice(server_seq); // Sequence num matches server stream
         ack_packet[28..32].copy_from_slice(&ack_num.to_be_bytes()); // Acknowledgment num
         ack_packet[32] = 0x50; // Data offset: 5 (20 bytes)
         ack_packet[33] = 0x10; // Flags: ACK (bit 4)

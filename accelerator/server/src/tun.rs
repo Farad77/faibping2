@@ -93,6 +93,35 @@ pub fn create_tun(name: &str, ip_cidr: &str) -> io::Result<TunDevice> {
         warn!("Failed to bring up TUN dev via ip command: {}", e);
     }
 
+    // 1. Enable Linux IPv4 packet forwarding
+    info!("Enabling Linux IPv4 packet forwarding and disabling rp_filter...");
+    let _ = Command::new("sysctl").args(["-w", "net.ipv4.ip_forward=1"]).status();
+    let _ = Command::new("sysctl").args(["-w", "net.ipv4.conf.all.rp_filter=0"]).status();
+    let _ = Command::new("sysctl").args(["-w", "net.ipv4.conf.default.rp_filter=0"]).status();
+
+    // 2. Configure iptables NAT Masquerade and Forwarding for the tunnel subnet
+    let net_prefix = if let Some((base, _)) = ip_cidr.split_once('/') {
+        let parts: Vec<&str> = base.split('.').collect();
+        if parts.len() == 4 {
+            format!("{}.{}.{}.0/24", parts[0], parts[1], parts[2])
+        } else {
+            "10.8.0.0/24".to_string()
+        }
+    } else {
+        "10.8.0.0/24".to_string()
+    };
+
+    info!("Configuring iptables NAT masquerade for subnet {}...", net_prefix);
+    let _ = Command::new("iptables")
+        .args(["-t", "nat", "-A", "POSTROUTING", "-s", &net_prefix, "-j", "MASQUERADE"])
+        .status();
+    let _ = Command::new("iptables")
+        .args(["-A", "FORWARD", "-i", name, "-j", "ACCEPT"])
+        .status();
+    let _ = Command::new("iptables")
+        .args(["-A", "FORWARD", "-o", name, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT"])
+        .status();
+
     let read_file = file.try_clone()?;
     let mut write_file = file;
 

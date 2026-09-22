@@ -21,7 +21,7 @@
     "target_subnets": ["0.0.0.0/0"]
   },
   "optimizations": {
-    "enable_fastconnect": true,
+    "enable_fastconnect": false,
     "enable_multipath_dup": true,
     "packet_duplication_rate": 2,
     "dscp_tag": 46
