@@ -2,6 +2,7 @@
 name = "accelerator-client"
 version = "0.1.0"
 edition = "2021"
+default-run = "accelerator-client"
 authors = ["FastPing Core Team"]
 
 [dependencies]

@@ -1,0 +1,19 @@
+{
+  "game_id": "custom_game",
+  "name": "Custom Game Template",
+  "executables": [
+    "game.exe",
+    "game_client.exe"
+  ],
+  "routing": {
+    "protocol": "BOTH",
+    "ports": [80, 443, "7000-8000"],
+    "target_subnets": ["0.0.0.0/0"]
+  },
+  "optimizations": {
+    "enable_fastconnect": false,
+    "enable_multipath_dup": true,
+    "packet_duplication_rate": 2,
+    "dscp_tag": 46
+  }
+}
