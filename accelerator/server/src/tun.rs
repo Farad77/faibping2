@@ -116,10 +116,16 @@ pub fn create_tun(name: &str, ip_cidr: &str) -> io::Result<TunDevice> {
         .args(["-t", "nat", "-A", "POSTROUTING", "-s", &net_prefix, "-j", "MASQUERADE"])
         .status();
     let _ = Command::new("iptables")
+        .args(["-A", "FORWARD", "-s", &net_prefix, "-j", "ACCEPT"])
+        .status();
+    let _ = Command::new("iptables")
+        .args(["-A", "FORWARD", "-d", &net_prefix, "-j", "ACCEPT"])
+        .status();
+    let _ = Command::new("iptables")
         .args(["-A", "FORWARD", "-i", name, "-j", "ACCEPT"])
         .status();
     let _ = Command::new("iptables")
-        .args(["-A", "FORWARD", "-o", name, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT"])
+        .args(["-A", "FORWARD", "-o", name, "-j", "ACCEPT"])
         .status();
 
     let read_file = file.try_clone()?;

@@ -200,13 +200,18 @@ fn run_divert_loop(
                     if let Some(pkt) = pkt_opt {
                         let mut inbound_addr = *last_addr_inbound.lock().unwrap();
                         inbound_addr[10] &= !0x02; // Set Inbound direction (clear Outbound bit 17)
-                        inbound_send(
+                        inbound_addr[10] |= 0xE0;  // Mark IPChecksum, TCPChecksum, UDPChecksum valid (bits 21, 22, 23)
+                        let ok = inbound_send(
                             inbound_handle,
                             pkt.as_ptr(),
                             pkt.len() as u32,
                             &mut write_len,
                             inbound_addr.as_ptr(),
                         );
+                        if ok == 0 {
+                            let err = windows_sys::Win32::Foundation::GetLastError();
+                            error!("[WinDivert] Failed to inject return packet into Windows stack: error {}", err);
+                        }
                     } else {
                         break;
                     }
