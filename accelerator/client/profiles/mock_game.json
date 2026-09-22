@@ -1,0 +1,19 @@
+{
+  "game_id": "mock_game",
+  "name": "FastPing Test Harness (Mock MMO Game)",
+  "executables": [
+    "mock_game.exe",
+    "MockGame.exe"
+  ],
+  "routing": {
+    "protocol": "BOTH",
+    "ports": [7777, 8000],
+    "target_subnets": ["0.0.0.0/0"]
+  },
+  "optimizations": {
+    "enable_fastconnect": true,
+    "enable_multipath_dup": true,
+    "packet_duplication_rate": 2,
+    "dscp_tag": 46
+  }
+}
