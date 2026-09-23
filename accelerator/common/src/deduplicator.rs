@@ -86,6 +86,15 @@ impl Deduplicator {
             // Same or older packet arrived
             let lag = highest.wrapping_sub(seq) as usize;
             if lag >= WINDOW_SIZE {
+                if lag > 2048 {
+                    // Sequence stream reset or client restarted with fresh sequence numbers.
+                    // Resynchronize window to avoid permanently dropping all future packets.
+                    self.reset();
+                    self.highest_seq = Some(seq);
+                    self.bitmap[0] = 1;
+                    self.accepted_in_order = self.accepted_in_order.wrapping_add(1);
+                    return true;
+                }
                 // Older than the 1024-packet window -> Stale
                 self.stale_dropped = self.stale_dropped.wrapping_add(1);
                 false
@@ -231,5 +240,18 @@ mod tests {
         // Packets in the new window work
         assert!(dedup.process_packet(2000));
         assert!(!dedup.process_packet(2000));
+    }
+
+    #[test]
+    fn test_backward_sequence_resync() {
+        let mut dedup = Deduplicator::new();
+        // Previous session left a high sequence
+        assert!(dedup.process_packet(221_726_729));
+
+        // Client restarts and begins from seq 1
+        assert!(dedup.process_packet(1), "Seq 1 after large jump backwards must trigger resync");
+        assert!(dedup.process_packet(2), "Seq 2 accepted in order");
+        assert!(!dedup.process_packet(1), "Seq 1 duplicate dropped");
+        assert_eq!(dedup.highest_seq(), Some(2));
     }
 }

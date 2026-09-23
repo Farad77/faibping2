@@ -223,9 +223,17 @@ async fn handle_uplink_packet(
     {
         let mut c = clients.lock().await;
         if channel_id == 1 {
-            c.ch1 = Some(peer_addr);
+            if c.ch1 != Some(peer_addr) {
+                tracing::info!("Channel 1 client endpoint updated: {:?} -> {}", c.ch1, peer_addr);
+                c.ch1 = Some(peer_addr);
+                let mut d = dedup.lock().await;
+                d.reset();
+            }
         } else {
-            c.ch2 = Some(peer_addr);
+            if c.ch2 != Some(peer_addr) {
+                tracing::info!("Channel 2 client endpoint updated: {:?} -> {}", c.ch2, peer_addr);
+                c.ch2 = Some(peer_addr);
+            }
         }
     }
 
