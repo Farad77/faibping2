@@ -50,11 +50,19 @@ struct GuiState {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open("fastping.log")
+        .unwrap_or_else(|_| std::fs::File::create("fastping_backup.log").unwrap());
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "info".into()),
         )
+        .with_writer(log_file)
         .init();
 
     info!("============================================================");

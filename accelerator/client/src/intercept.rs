@@ -147,11 +147,18 @@ fn run_divert_loop(
         ) -> i32;
 
         type WinDivertCloseFn = unsafe extern "system" fn(handle: *mut std::ffi::c_void) -> i32;
+        type WinDivertCalcChecksumsFn = unsafe extern "system" fn(
+            p_packet: *mut u8,
+            packet_len: u32,
+            p_addr: *mut u8,
+            flags: u64,
+        ) -> u32;
 
         let open_sym = CString::new("WinDivertOpen").unwrap();
         let recv_sym = CString::new("WinDivertRecv").unwrap();
         let send_sym = CString::new("WinDivertSend").unwrap();
         let close_sym = CString::new("WinDivertClose").unwrap();
+        let csum_sym = CString::new("WinDivertHelperCalcChecksums").unwrap();
 
         unsafe {
             let open_fn: WinDivertOpenFn = std::mem::transmute(
@@ -166,6 +173,15 @@ fn run_divert_loop(
             let close_fn: WinDivertCloseFn = std::mem::transmute(
                 windows_sys::Win32::System::LibraryLoader::GetProcAddress(h_module, close_sym.as_ptr() as *const u8),
             );
+            let csum_proc = windows_sys::Win32::System::LibraryLoader::GetProcAddress(
+                h_module,
+                csum_sym.as_ptr() as *const u8,
+            );
+            let csum_fn: Option<WinDivertCalcChecksumsFn> = if csum_proc.is_some() {
+                Some(std::mem::transmute(csum_proc))
+            } else {
+                None
+            };
 
             let filter = CString::new("outbound and !loopback and (tcp or udp)").unwrap();
             let handle = open_fn(filter.as_ptr(), 0 /* NETWORK layer */, 0, 0);
@@ -197,10 +213,17 @@ fn run_divert_loop(
                         let mut rx = inbound_rx_clone.blocking_lock();
                         rx.blocking_recv()
                     };
-                    if let Some(pkt) = pkt_opt {
+                    if let Some(mut pkt) = pkt_opt {
                         let mut inbound_addr = *last_addr_inbound.lock().unwrap();
                         inbound_addr[10] &= !0x02; // Set Inbound direction (clear Outbound bit 17)
-                        inbound_addr[10] |= 0xE0;  // Mark IPChecksum, TCPChecksum, UDPChecksum valid (bits 21, 22, 23)
+
+                        // Calculate kernel-accurate checksums using native WinDivert helper
+                        if let Some(csum) = csum_fn {
+                            csum(pkt.as_mut_ptr(), pkt.len() as u32, inbound_addr.as_mut_ptr(), 0);
+                        } else {
+                            inbound_addr[10] |= 0xE0;
+                        }
+
                         let ok = inbound_send(
                             inbound_handle,
                             pkt.as_ptr(),
@@ -211,6 +234,8 @@ fn run_divert_loop(
                         if ok == 0 {
                             let err = windows_sys::Win32::Foundation::GetLastError();
                             error!("[WinDivert] Failed to inject return packet into Windows stack: error {}", err);
+                        } else {
+                            info!("[WinDivert] Successfully injected return packet into Windows stack ({} bytes)", pkt.len());
                         }
                     } else {
                         break;
