@@ -117,7 +117,13 @@ if [[ -z "${BIN_SRC}" || ! -f "${BIN_SRC}" ]]; then
 fi
 
 echo "[*] Installing binary from ${BIN_SRC} to /usr/local/bin/gametunnel-server..."
-cp "${BIN_SRC}" /usr/local/bin/gametunnel-server
+# Stop existing service / process to prevent 'Text file busy'
+systemctl stop gametunnel-server 2>/dev/null || true
+pkill -f gametunnel-server 2>/dev/null || true
+pkill -f accelerator-server 2>/dev/null || true
+
+# Copy using --remove-destination to unlink the old inode cleanly
+cp --remove-destination "${BIN_SRC}" /usr/local/bin/gametunnel-server || install -m 755 "${BIN_SRC}" /usr/local/bin/gametunnel-server
 chmod +x /usr/local/bin/gametunnel-server
 
 # 6. Systemd service creation
