@@ -244,6 +244,13 @@ async fn handle_http_request(
         }
         let resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK";
         let _ = socket.write_all(resp.as_bytes()).await;
+    } else if method == "POST" && path == "/api/exit" {
+        let resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK";
+        let _ = socket.write_all(resp.as_bytes()).await;
+        tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            std::process::exit(0);
+        });
     } else {
         let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         let _ = socket.write_all(resp.as_bytes()).await;

@@ -240,8 +240,11 @@ fn run_divert_loop(
                 let packet = &packet_buf[..read_len as usize];
                 if let Some((is_tcp, src_port, dst_port)) = parse_l4_ports(packet) {
                     let state = state_rx.borrow().clone();
-                    let matches_game = state.tracked_ports.contains(&src_port)
-                        || (state.is_running && profile.matches_port(dst_port));
+                    // Web authentication, CDN downloads, and DNS must never be intercepted
+                    let is_web_traffic = dst_port == 443 || dst_port == 80 || dst_port == 53;
+                    let matches_game = !is_web_traffic
+                        && (state.tracked_ports.contains(&src_port) || state.is_running)
+                        && profile.matches_port(dst_port);
 
                     if matches_game {
                         // 1. FastConnect: Synthesize and immediately inject local TCP ACK into Windows stack

@@ -57,16 +57,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // 2. Test TUN Internet Forwarding (TCP SYN to 1.1.1.1:80)
-    println!("\nTesting Internet Forwarding through VPS TUN (TCP SYN to 1.1.1.1:80 with seq {}, port {})...", seq_syn, local_tcp_port);
+    // 2. Test TUN Internet Forwarding (TCP SYN to PoE Login Gateway 172.65.166.147:20493)
+    println!("\nTesting Internet Forwarding through VPS TUN (TCP SYN to PoE Login 172.65.166.147:20493 with seq {}, port {})...", seq_syn, local_tcp_port);
     let mut raw_syn = vec![0u8; 40];
     raw_syn[0] = 0x45; // IPv4, IHL 5
+    raw_syn[2..4].copy_from_slice(&(40u16).to_be_bytes()); // IPv4 Total Length = 40
     raw_syn[8] = 64;   // TTL
     raw_syn[9] = 6;    // TCP
     raw_syn[12..16].copy_from_slice(&[10, 8, 0, 2]); // Virtual tunnel IP
-    raw_syn[16..20].copy_from_slice(&[1, 1, 1, 1]);  // 1.1.1.1
+    raw_syn[16..20].copy_from_slice(&[172, 65, 166, 147]);  // 172.65.166.147 (par.login.pathofexile.com)
     raw_syn[20..22].copy_from_slice(&local_tcp_port.to_be_bytes()); // Local src port
-    raw_syn[22..24].copy_from_slice(&80u16.to_be_bytes());    // Dst port 80
+    raw_syn[22..24].copy_from_slice(&20493u16.to_be_bytes());    // Dst port 20493
     raw_syn[24..28].copy_from_slice(&100000u32.to_be_bytes()); // Seq number
     raw_syn[32] = 0x50; // Data offset 5
     raw_syn[33] = 0x02; // SYN flag
@@ -80,7 +81,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let t1 = Instant::now();
     sock.send(&tunnel_buf).await?;
-    println!("Sent encapsulated TCP SYN to 1.1.1.1:80 via tunnel...");
+    println!("Sent encapsulated TCP SYN to 172.65.166.147:20493 via tunnel...");
 
     let mut synack_received = false;
     let deadline = Instant::now() + Duration::from_millis(3000);
