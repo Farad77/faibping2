@@ -20,13 +20,15 @@ echo "[*] Detected default WAN interface: ${WAN_IFACE}"
 # 1. System packages
 echo "[*] Updating repositories and installing essential packages..."
 apt-get update -qq
-apt-get install -y -qq nftables iproute2 curl build-essential git ethtool
+apt-get install -y -qq nftables iptables iproute2 curl build-essential git ethtool
 
 # 2. Kernel sysctl tuning (BBR, CAKE, IP Forwarding, Low-latency buffers)
 echo "[*] Applying hardened low-latency sysctl configuration..."
 cat <<EOF > /etc/sysctl.d/99-gametunnel.conf
 # Enable IPv4 packet forwarding for tunnel gateway
 net.ipv4.ip_forward = 1
+net.ipv4.conf.all.rp_filter = 0
+net.ipv4.conf.default.rp_filter = 0
 
 # BBR Congestion Control & CAKE Queue Scheduler
 net.core.default_qdisc = cake
@@ -56,14 +58,28 @@ echo "[+] Kernel parameters applied successfully."
 echo "[*] Applying CAKE qdisc on ${WAN_IFACE}..."
 tc qdisc replace dev "${WAN_IFACE}" root cake diffserv4 ack-filter || true
 
-# 4. nftables configuration
-echo "[*] Configuring nftables with MSS Clamping and Masquerading..."
-mkdir -p /etc/nftables
-sed "s/eth0/${WAN_IFACE}/g" "$(dirname "$0")/nftables.conf" > /etc/nftables.conf
-nft -f /etc/nftables.conf
-systemctl enable --now nftables
+# 4. Routing, iptables NAT Masquerading & nftables configuration
+echo "[*] Applying IP forwarding and disabling rp_filter..."
+sysctl -w net.ipv4.ip_forward=1
+sysctl -w net.ipv4.conf.all.rp_filter=0
+sysctl -w net.ipv4.conf.default.rp_filter=0
 
-echo "[+] nftables configured and active."
+echo "[*] Configuring iptables NAT masquerade and forwarding for 10.8.0.0/24..."
+iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -j MASQUERADE || true
+iptables -A FORWARD -s 10.8.0.0/24 -j ACCEPT || true
+iptables -A FORWARD -d 10.8.0.0/24 -j ACCEPT || true
+iptables -A FORWARD -i tun-game -j ACCEPT || true
+iptables -A FORWARD -o tun-game -j ACCEPT || true
+
+if command -v nft &> /dev/null && [[ -f "$(dirname "$0")/nftables.conf" ]]; then
+    echo "[*] Configuring nftables with MSS Clamping and Masquerading..."
+    mkdir -p /etc/nftables
+    sed "s/eth0/${WAN_IFACE}/g" "$(dirname "$0")/nftables.conf" > /etc/nftables.conf
+    nft -f /etc/nftables.conf || true
+    systemctl enable --now nftables || true
+fi
+
+echo "[+] Firewall & NAT configured and active."
 
 # 5. Build and install accelerator-server
 echo "[*] Installing Rust toolchain if not present..."
@@ -112,6 +128,7 @@ After=network.target
 
 [Service]
 Type=simple
+ExecStartPre=/bin/sh -c 'sysctl -w net.ipv4.ip_forward=1 && sysctl -w net.ipv4.conf.all.rp_filter=0 && (iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -j MASQUERADE 2>/dev/null || true) && (iptables -A FORWARD -s 10.8.0.0/24 -j ACCEPT 2>/dev/null || true) && (iptables -A FORWARD -d 10.8.0.0/24 -j ACCEPT 2>/dev/null || true)'
 ExecStart=/usr/local/bin/gametunnel-server --listen-ch1 0.0.0.0:51820 --listen-ch2 0.0.0.0:4433 --tun-ip 10.8.0.1/24
 Restart=always
 RestartSec=3
