@@ -2,17 +2,30 @@
   "game_id": "aion2",
   "name": "Aion 2 (MMORPG)",
   "executables": [
+    "AION2.exe",
     "Aion2.exe",
     "Aion2-Win64-Shipping.exe",
-    "Aion2Launcher.exe"
+    "Aion2Launcher.exe",
+    "Aion2_Client.exe"
   ],
   "routing": {
     "protocol": "BOTH",
-    "ports": [3724, 7777, 8000, "9000-9100"],
+    "ports": [
+      2106,
+      3724,
+      7777,
+      8000,
+      10241,
+      "2000-4000",
+      "7000-8500",
+      "9000-11000",
+      "27015-27030",
+      "30000-35000"
+    ],
     "target_subnets": ["0.0.0.0/0"]
   },
   "optimizations": {
-    "enable_fastconnect": true,
+    "enable_fastconnect": false,
     "enable_multipath_dup": true,
     "packet_duplication_rate": 2,
     "dscp_tag": 46
