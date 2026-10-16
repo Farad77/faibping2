@@ -83,7 +83,7 @@ impl InterceptionEngine {
         let inbound_rx = Arc::clone(&self.inbound_rx);
         let handle_slot = Arc::clone(&self.handle_slot);
 
-        info!("[InterceptionEngine] Starting WinDivert filter: 'outbound and !loopback and (tcp or udp)'");
+        info!("[InterceptionEngine] Starting WinDivert filter: 'outbound and !loopback and ip and (tcp or udp)'");
 
         // Background worker loop
         tokio::task::spawn_blocking(move || {
@@ -107,6 +107,7 @@ fn run_divert_loop(
 ) {
     #[cfg(windows)]
     {
+        use std::collections::HashSet;
         use std::ffi::CString;
 
         // Try dynamically loading WinDivert.dll
@@ -186,7 +187,7 @@ fn run_divert_loop(
                 None
             };
 
-            let filter = CString::new("outbound and !loopback and (tcp or udp)").unwrap();
+            let filter = CString::new("outbound and !loopback and ip and (tcp or udp)").unwrap();
             let handle = open_fn(filter.as_ptr(), 0 /* NETWORK layer */, 0, 0);
 
             if handle.is_null() {
@@ -222,13 +223,14 @@ fn run_divert_loop(
                             break;
                         }
                         let mut inbound_addr = *last_addr_inbound.lock().unwrap();
-                        inbound_addr[10] &= !0x02; // Set Inbound direction (clear Outbound bit 17)
+                        // Clear Outbound, Loopback, Impostor, and IPv6 flags on byte 10
+                        inbound_addr[10] = 0;
 
                         // Calculate kernel-accurate checksums using native WinDivert helper
                         if let Some(csum) = csum_fn {
                             csum(pkt.as_mut_ptr(), pkt.len() as u32, inbound_addr.as_mut_ptr(), 0);
                         } else {
-                            inbound_addr[10] |= 0xE0;
+                            inbound_addr[10] = 0xE0;
                         }
 
                         let ok = inbound_send(
@@ -257,6 +259,11 @@ fn run_divert_loop(
             let mut packet_buf = vec![0u8; 65535];
             let mut addr_buf = [0u8; 128];
             let mut read_len = 0u32;
+            // Track TCP connections whose initial SYN was routed through the tunnel so we:
+            // 1) Never hijack already-established TCP connections mid-stream
+            // 2) Consistently tunnel all packets of connections initiated through the tunnel
+            let mut tunneled_tcp_flows: HashSet<(u16, [u8; 4], u16)> = HashSet::new();
+            let allow_udp = !profile.routing.protocol.eq_ignore_ascii_case("TCP");
 
             loop {
                 let ok = recv_fn(
@@ -271,8 +278,6 @@ fn run_divert_loop(
                     break;
                 }
 
-                *last_addr.lock().unwrap() = addr_buf;
-
                 let packet = &packet_buf[..read_len as usize];
                 if let Some((is_tcp, src_port, dst_port)) = parse_l4_ports(packet) {
                     let state = state_rx.borrow().clone();
@@ -286,26 +291,67 @@ fn run_divert_loop(
                         let bp = DIRECT_PROBE_PORT.load(Ordering::Relaxed);
                         bp != 0 && src_port == bp
                     };
-                    let is_private_dst = if packet.len() >= 20 {
+                    let (dst_ip, is_private_dst) = if packet.len() >= 20 {
                         let d0 = packet[16];
                         let d1 = packet[17];
-                        d0 == 127 || d0 == 10 || (d0 == 192 && d1 == 168) || (d0 == 172 && (16..=31).contains(&d1))
+                        let priv_ip = d0 == 127
+                            || d0 == 10
+                            || (d0 == 192 && d1 == 168)
+                            || (d0 == 172 && (16..=31).contains(&d1))
+                            || (d0 == 169 && d1 == 254)
+                            || d0 >= 224;
+                        ([d0, d1, packet[18], packet[19]], priv_ip)
                     } else {
-                        false
+                        ([0, 0, 0, 0], true)
                     };
 
-                    let matches_game = !is_web_or_tunnel
-                        && !is_probe_bypass
-                        && !is_private_dst
-                        && (state.tracked_ports.contains(&src_port)
-                            || (state.is_running && profile.matches_port(dst_port)));
+                    if !is_private_dst {
+                        *last_addr.lock().unwrap() = addr_buf;
+                    }
+
+                    let matches_game = if is_web_or_tunnel || is_probe_bypass || is_private_dst {
+                        false
+                    } else if is_tcp {
+                        let ihl = (packet[0] & 0x0F) as usize * 4;
+                        let tcp_flags = if packet.len() > ihl + 13 { packet[ihl + 13] } else { 0 };
+                        let is_syn_only = (tcp_flags & 0x02) != 0 && (tcp_flags & 0x10) == 0;
+                        let flow_key = (src_port, dst_ip, dst_port);
+
+                        if is_syn_only {
+                            let belongs_to_game = state.tracked_ports.contains(&src_port)
+                                || (state.is_running && crate::watcher::is_tcp_port_owned_by_pids(src_port, &state.pids))
+                                || (state.is_running && profile.matches_port(dst_port));
+                            if belongs_to_game {
+                                if tunneled_tcp_flows.len() > 4096 {
+                                    tunneled_tcp_flows.clear();
+                                }
+                                if tunneled_tcp_flows.insert(flow_key) {
+                                    info!(
+                                        "[InterceptionEngine] Tunneling new game TCP flow: :{} -> {}.{}.{}.{}:{}",
+                                        src_port, dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3], dst_port
+                                    );
+                                }
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            tunneled_tcp_flows.contains(&flow_key)
+                        }
+                    } else {
+                        allow_udp
+                            && (state.tracked_ports.contains(&src_port)
+                                || (state.is_running && profile.matches_port(dst_port)))
+                    };
 
                     if matches_game {
+                        *last_addr.lock().unwrap() = addr_buf;
+
                         // 1. FastConnect: Synthesize and immediately inject local TCP ACK into Windows stack
                         if is_tcp && fastconnect.is_enabled() {
                             if let Some(ack_packet) = fastconnect.synthesize_local_ack(packet) {
                                 let mut ack_addr = addr_buf;
-                                ack_addr[10] &= !0x02; // Inbound direction (clear Outbound bit 17)
+                                ack_addr[10] = 0; // Inbound direction
                                 let mut write_ack_len = 0u32;
                                 send_fn(
                                     handle,

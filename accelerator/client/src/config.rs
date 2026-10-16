@@ -105,7 +105,7 @@ impl GameProfile {
             }
         }
         match self.game_id.as_str() {
-            "aion2" => "13.232.110.60:443".to_string(),
+            "aion2" => "193.202.112.95:13328".to_string(),
             "pathofexile" => "170.23.143.92:6112".to_string(),
             "farever" => "188.42.43.98:6022".to_string(),
             _ => "172.65.166.147:20493".to_string(),

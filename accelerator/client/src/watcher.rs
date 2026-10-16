@@ -211,6 +211,7 @@ fn get_process_sockets(
         );
 
         if size > 0 {
+            size += 512;
             let mut buffer = vec![0u8; size as usize];
             if GetExtendedTcpTable(
                 buffer.as_mut_ptr() as *mut _,
@@ -279,6 +280,7 @@ fn get_process_sockets(
         );
 
         if udp_size > 0 {
+            udp_size += 512;
             let mut buffer = vec![0u8; udp_size as usize];
             if GetExtendedUdpTable(
                 buffer.as_mut_ptr() as *mut _,
@@ -303,6 +305,62 @@ fn get_process_sockets(
     }
 
     (ports, best_remote)
+}
+
+/// Fast synchronous check called on outbound TCP SYN packets to determine if a newly
+/// created local TCP port belongs to one of the target game PIDs at t=0ms (before the
+/// 500ms polling loop has updated `tracked_ports`).
+#[cfg(windows)]
+pub fn is_tcp_port_owned_by_pids(local_port: u16, target_pids: &[u32]) -> bool {
+    if target_pids.is_empty() {
+        return false;
+    }
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GetExtendedTcpTable, TCP_TABLE_OWNER_PID_ALL,
+    };
+    use windows_sys::Win32::Networking::WinSock::AF_INET;
+
+    unsafe {
+        let mut size = 0u32;
+        let _ = GetExtendedTcpTable(
+            std::ptr::null_mut(),
+            &mut size,
+            0,
+            AF_INET as u32,
+            TCP_TABLE_OWNER_PID_ALL,
+            0,
+        );
+        if size == 0 {
+            return false;
+        }
+        size += 512;
+        let mut buffer = vec![0u8; size as usize];
+        if GetExtendedTcpTable(
+            buffer.as_mut_ptr() as *mut _,
+            &mut size,
+            0,
+            AF_INET as u32,
+            TCP_TABLE_OWNER_PID_ALL,
+            0,
+        ) == 0
+        {
+            let num_entries = *(buffer.as_ptr() as *const u32);
+            let rows_ptr = buffer.as_ptr().add(4) as *const MIB_TCPROW_OWNER_PID;
+            for i in 0..num_entries as usize {
+                let row = &*rows_ptr.add(i);
+                let port = u16::from_be(row.dwLocalPort as u16);
+                if port == local_port && target_pids.contains(&row.dwOwningPid) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+#[cfg(not(windows))]
+pub fn is_tcp_port_owned_by_pids(_local_port: u16, _target_pids: &[u32]) -> bool {
+    false
 }
 
 #[cfg(windows)]
