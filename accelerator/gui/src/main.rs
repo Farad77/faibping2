@@ -3,12 +3,14 @@
 //! Provides a modern zero-terminal desktop user interface.
 //! Serves an embedded high-performance dark gaming dashboard on 127.0.0.1:4040
 //! and launches a dedicated native application window.
+//! Includes an Always-On Latency & Process Monitor for live Before/After comparison.
 
-use std::net::SocketAddr;
+use std::collections::HashSet;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -18,11 +20,12 @@ use tracing::{error, info};
 mod web_ui;
 
 use accelerator_client::config::GameProfile;
-use accelerator_client::intercept::{InterceptedPacket, InterceptionEngine};
+use accelerator_client::intercept::{InterceptedPacket, InterceptionEngine, DIRECT_PROBE_PORT};
 use accelerator_client::registry::RegistryOptimizer;
 use accelerator_client::settings::AppSettings;
 use accelerator_client::transport::MultipathTransport;
-use accelerator_client::watcher::ProcessWatcher;
+use accelerator_client::watcher::{scan_game_state, ProcessWatcher};
+use accelerator_common::protocol::{GameTunnelHeader, HEADER_LEN};
 
 #[derive(Default, Clone)]
 struct GuiState {
@@ -36,6 +39,10 @@ struct GuiState {
     game_detected: bool,
     pids: Vec<u32>,
     tracked_ports_count: usize,
+    target_endpoint: String,
+    direct_rtt: f64,
+    direct_jitter: f64,
+    baseline_rtt: f64,
     path1_rtt: f64,
     path1_jitter: f64,
     path1_tx: u64,
@@ -71,9 +78,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let settings = Arc::new(Mutex::new(AppSettings::load_or_default("settings.json")));
     let initial_settings = settings.lock().await.clone();
-    let initial_game_name = GameProfile::load_from_file(&initial_settings.active_profile)
-        .map(|p| p.name)
-        .unwrap_or_else(|_| "Path of Exile".to_string());
+    let initial_profile = load_profile_with_fallback(&initial_settings.active_profile);
+    let initial_game_name = initial_profile.name.clone();
+    let initial_target = format!("{} (Cible)", initial_profile.default_benchmark_endpoint());
 
     let is_admin = RegistryOptimizer::is_admin();
     let state = Arc::new(Mutex::new(GuiState {
@@ -84,10 +91,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         vps_ch2: initial_settings.vps_ch2,
         active_profile_path: initial_settings.active_profile.clone(),
         game_name: initial_game_name,
+        target_endpoint: initial_target,
         ..Default::default()
     }));
 
     let stop_signal = Arc::new(AtomicBool::new(false));
+
+    // Spawn Always-On Background Game & Latency Monitor (runs even when Boost is OFF)
+    let state_monitor = Arc::clone(&state);
+    tokio::spawn(async move {
+        run_always_on_monitor(state_monitor).await;
+    });
 
     // Bind local web server on 127.0.0.1:4040
     let listener = TcpListener::bind("127.0.0.1:4040").await?;
@@ -134,6 +148,190 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn load_profile_with_fallback(profile_path: &str) -> GameProfile {
+    let p_path = PathBuf::from(profile_path);
+    match GameProfile::load_from_file(&p_path) {
+        Ok(p) => p,
+        Err(_) => {
+            let sub = Path::new("accelerator/client/profiles")
+                .join(p_path.file_name().unwrap_or_default());
+            GameProfile::load_from_file(sub).unwrap_or_else(|_| GameProfile {
+                game_id: "aion2".into(),
+                name: "Aion 2 (MMORPG)".into(),
+                executables: vec!["AION2.exe".into(), "Aion2.exe".into()],
+                routing: accelerator_client::config::RoutingConfig {
+                    protocol: "BOTH".into(),
+                    ports: vec![accelerator_client::config::PortMatcher::Single(7777)],
+                    target_subnets: vec!["0.0.0.0/0".into()],
+                    benchmark_endpoint: Some("13.232.110.60:443".into()),
+                },
+                optimizations: accelerator_client::config::OptimizationsConfig {
+                    enable_fastconnect: false,
+                    enable_multipath_dup: true,
+                    packet_duplication_rate: 2,
+                    dscp_tag: 46,
+                },
+            })
+        }
+    }
+}
+
+/// Runs continuously in the background (even when Boost is OFF) to:
+/// 1. Detect the currently selected game process and its live remote server IP:Port.
+/// 2. Measure Direct ISP Latency & Jitter to the game server (using a bypassed probe port).
+/// 3. Measure VPS Tunnel Latency & Jitter when Boost is OFF so Before/After comparison is always live.
+async fn run_always_on_monitor(state: Arc<Mutex<GuiState>>) {
+    let mut ticker = tokio::time::interval(Duration::from_millis(1500));
+    let mut boosted_pids = HashSet::new();
+    let mut probe_seq = 1u32;
+
+    loop {
+        ticker.tick().await;
+        probe_seq = probe_seq.wrapping_add(1);
+
+        let (is_running, profile_path, vps_host, vps_ch1, vps_ch2) = {
+            let s = state.lock().await;
+            (
+                s.running,
+                s.active_profile_path.clone(),
+                s.vps_host.clone(),
+                s.vps_ch1,
+                s.vps_ch2,
+            )
+        };
+
+        let profile = load_profile_with_fallback(&profile_path);
+        let proc_state = scan_game_state(&profile, &mut boosted_pids);
+
+        // Determine target game server SocketAddr (live socket if game is running, else profile benchmark target)
+        let (target_addr_opt, endpoint_label) = if let Some(live_addr) = proc_state.active_remote_endpoint {
+            (Some(live_addr), format!("{} (Serveur Actif)", live_addr))
+        } else {
+            let fallback_str = profile.default_benchmark_endpoint();
+            let resolved = fallback_str
+                .to_socket_addrs()
+                .ok()
+                .and_then(|mut it| it.find(|a| a.is_ipv4()));
+            (resolved, format!("{} (Serveur Cible)", fallback_str))
+        };
+
+        // Measure Direct ISP Latency (bypassing WinDivert via DIRECT_PROBE_PORT)
+        let direct_sample = if let Some(target_addr) = target_addr_opt {
+            measure_direct_tcp_rtt(target_addr).await
+        } else {
+            None
+        };
+
+        // When Boost is OFF, also probe VPS tunnel channels so Before/After comparison is ready before activation
+        let (idle_p1, idle_p2) = if !is_running {
+            let ch1_addr: Option<SocketAddr> = format!("{}:{}", vps_host, vps_ch1).parse().ok();
+            let ch2_addr: Option<SocketAddr> = format!("{}:{}", vps_host, vps_ch2).parse().ok();
+            let (r1, r2) = tokio::join!(
+                async {
+                    if let Some(a) = ch1_addr {
+                        probe_vps_udp(a, probe_seq).await
+                    } else {
+                        None
+                    }
+                },
+                async {
+                    if let Some(a) = ch2_addr {
+                        probe_vps_udp(a, probe_seq).await
+                    } else {
+                        None
+                    }
+                }
+            );
+            (r1, r2)
+        } else {
+            (None, None)
+        };
+
+        let mut s = state.lock().await;
+        s.game_name = profile.name;
+        s.target_endpoint = endpoint_label;
+
+        if !s.running {
+            s.game_detected = proc_state.is_running;
+            s.pids = proc_state.pids;
+            s.tracked_ports_count = proc_state.tracked_ports.len();
+        }
+
+        if let Some(sample) = direct_sample {
+            let (nrtt, njit) = compute_ewma(s.direct_rtt, s.direct_jitter, sample);
+            s.direct_rtt = nrtt;
+            s.direct_jitter = njit;
+            if !s.running || s.baseline_rtt == 0.0 {
+                s.baseline_rtt = s.direct_rtt;
+            }
+        }
+
+        if !s.running {
+            if let Some(r1) = idle_p1 {
+                s.path1_probes += 1;
+                s.path1_acked += 1;
+                let (nrtt, njit) = compute_ewma(s.path1_rtt, s.path1_jitter, r1);
+                s.path1_rtt = nrtt;
+                s.path1_jitter = njit;
+            }
+            if let Some(r2) = idle_p2 {
+                s.path2_probes += 1;
+                s.path2_acked += 1;
+                let (nrtt, njit) = compute_ewma(s.path2_rtt, s.path2_jitter, r2);
+                s.path2_rtt = nrtt;
+                s.path2_jitter = njit;
+            }
+        }
+    }
+}
+
+fn compute_ewma(rtt: f64, jitter: f64, sample: f64) -> (f64, f64) {
+    if rtt == 0.0 {
+        (sample, 0.0)
+    } else {
+        let diff = (sample - rtt).abs();
+        let new_rtt = 0.8 * rtt + 0.2 * sample;
+        let new_jitter = jitter + (diff - jitter) / 8.0;
+        (new_rtt, new_jitter)
+    }
+}
+
+async fn measure_direct_tcp_rtt(target: SocketAddr) -> Option<f64> {
+    let sock = tokio::net::TcpSocket::new_v4().ok()?;
+    let bind_addr: SocketAddr = "0.0.0.0:0".parse().ok()?;
+    sock.bind(bind_addr).ok()?;
+    if let Ok(local_addr) = sock.local_addr() {
+        DIRECT_PROBE_PORT.store(local_addr.port(), Ordering::Relaxed);
+    }
+    let t0 = Instant::now();
+    let res = tokio::time::timeout(Duration::from_millis(1200), sock.connect(target)).await;
+    match res {
+        Ok(Ok(_stream)) => Some(t0.elapsed().as_secs_f64() * 1000.0),
+        _ => None,
+    }
+}
+
+async fn probe_vps_udp(vps_addr: SocketAddr, seq: u32) -> Option<f64> {
+    let sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await.ok()?;
+    let mut buf = [0u8; HEADER_LEN];
+    let hdr = GameTunnelHeader::new(seq, 0, false, true);
+    hdr.encode(&mut buf).ok()?;
+    let t0 = Instant::now();
+    sock.send_to(&buf, vps_addr).await.ok()?;
+    let mut recv_buf = [0u8; 64];
+    match tokio::time::timeout(Duration::from_millis(1000), sock.recv_from(&mut recv_buf)).await {
+        Ok(Ok((n, _))) if n >= HEADER_LEN => {
+            if let Ok(resp) = GameTunnelHeader::decode(&recv_buf[..n]) {
+                if resp.is_ack() {
+                    return Some(t0.elapsed().as_secs_f64() * 1000.0);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 async fn handle_http_request(
     req: &str,
     socket: &mut tokio::net::TcpStream,
@@ -167,6 +365,10 @@ async fn handle_http_request(
             "game_detected": s.game_detected,
             "pids": s.pids,
             "tracked_ports_count": s.tracked_ports_count,
+            "target_endpoint": s.target_endpoint,
+            "direct_rtt": s.direct_rtt,
+            "direct_jitter": s.direct_jitter,
+            "baseline_rtt": s.baseline_rtt,
             "path1_rtt": s.path1_rtt,
             "path1_jitter": s.path1_jitter,
             "path1_tx": s.path1_tx,
@@ -237,7 +439,11 @@ async fn handle_http_request(
                 if let Some(host) = val.get("vps_host").and_then(|h| h.as_str()) {
                     sett.vps_host = host.to_string();
                 }
+                let mut profile_changed = false;
                 if let Some(prof) = val.get("active_profile").and_then(|p| p.as_str()) {
+                    if sett.active_profile != prof {
+                        profile_changed = true;
+                    }
                     sett.active_profile = prof.to_string();
                 }
                 let _ = sett.save("settings.json");
@@ -245,8 +451,13 @@ async fn handle_http_request(
                 let mut s = state.lock().await;
                 s.vps_host = sett.vps_host.clone();
                 s.active_profile_path = sett.active_profile.clone();
-                if let Ok(p) = GameProfile::load_from_file(&sett.active_profile) {
-                    s.game_name = p.name;
+                let loaded = load_profile_with_fallback(&sett.active_profile);
+                s.game_name = loaded.name.clone();
+                if profile_changed {
+                    s.direct_rtt = 0.0;
+                    s.direct_jitter = 0.0;
+                    s.baseline_rtt = 0.0;
+                    s.target_endpoint = format!("{} (Cible)", loaded.default_benchmark_endpoint());
                 }
             }
         }
@@ -270,33 +481,15 @@ async fn run_engine_worker(state: Arc<Mutex<GuiState>>, stop_signal: Arc<AtomicB
 
     let (vps_host, vps_ch1, vps_ch2, profile_path) = {
         let s = state.lock().await;
-        (s.vps_host.clone(), s.vps_ch1, s.vps_ch2, s.active_profile_path.clone())
+        (
+            s.vps_host.clone(),
+            s.vps_ch1,
+            s.vps_ch2,
+            s.active_profile_path.clone(),
+        )
     };
 
-    // Load Profile
-    let p_path = PathBuf::from(&profile_path);
-    let profile = match GameProfile::load_from_file(&p_path) {
-        Ok(p) => p,
-        Err(_) => {
-            let sub = Path::new("accelerator/client/profiles").join(p_path.file_name().unwrap_or_default());
-            GameProfile::load_from_file(sub).unwrap_or_else(|_| GameProfile {
-                game_id: "farever".into(),
-                name: "Farever".into(),
-                executables: vec!["Farever.exe".into()],
-                routing: accelerator_client::config::RoutingConfig {
-                    protocol: "TCP".into(),
-                    ports: vec![accelerator_client::config::PortMatcher::Single(6022)],
-                    target_subnets: vec!["0.0.0.0/0".into()],
-                },
-                optimizations: accelerator_client::config::OptimizationsConfig {
-                    enable_fastconnect: true,
-                    enable_multipath_dup: true,
-                    packet_duplication_rate: 2,
-                    dscp_tag: 46,
-                },
-            })
-        }
-    };
+    let profile = load_profile_with_fallback(&profile_path);
 
     {
         let mut s = state.lock().await;
@@ -334,7 +527,8 @@ async fn run_engine_worker(state: Arc<Mutex<GuiState>>, stop_signal: Arc<AtomicB
         profile.optimizations.dscp_tag,
         in_tx,
     )
-    .await {
+    .await
+    {
         Ok(t) => Arc::new(t),
         Err(e) => {
             error!("Transport bind error: {}", e);
@@ -349,7 +543,7 @@ async fn run_engine_worker(state: Arc<Mutex<GuiState>>, stop_signal: Arc<AtomicB
     let watcher_rx = watcher.subscribe();
     watcher.start().await;
 
-    // Interception Engine (FastConnect local ACK injection is executed internally)
+    // Interception Engine
     let interceptor = InterceptionEngine::new(profile.clone(), watcher_rx.clone(), out_tx, in_rx);
     interceptor.start().await;
 
@@ -366,21 +560,26 @@ async fn run_engine_worker(state: Arc<Mutex<GuiState>>, stop_signal: Arc<AtomicB
     while !stop_signal.load(Ordering::Relaxed) {
         ticker.tick().await;
         let proc = watcher_rx.borrow().clone();
-        let (rtt1, jit1, tx1, prb1, ack1, rtt2, jit2, tx2, prb2, ack2) = transport.get_metrics().await;
+        let (rtt1, jit1, tx1, prb1, ack1, rtt2, jit2, tx2, prb2, ack2) =
+            transport.get_metrics().await;
 
         let mut s = state.lock().await;
         s.game_detected = proc.is_running;
         s.pids = proc.pids;
         s.tracked_ports_count = proc.tracked_ports.len();
 
-        s.path1_rtt = rtt1;
-        s.path1_jitter = jit1;
+        if rtt1 > 0.0 {
+            s.path1_rtt = rtt1;
+            s.path1_jitter = jit1;
+        }
         s.path1_tx = tx1;
         s.path1_probes = prb1;
         s.path1_acked = ack1;
 
-        s.path2_rtt = rtt2;
-        s.path2_jitter = jit2;
+        if rtt2 > 0.0 {
+            s.path2_rtt = rtt2;
+            s.path2_jitter = jit2;
+        }
         s.path2_tx = tx2;
         s.path2_probes = prb2;
         s.path2_acked = ack2;
@@ -393,7 +592,5 @@ async fn run_engine_worker(state: Arc<Mutex<GuiState>>, stop_signal: Arc<AtomicB
     {
         let mut s = state.lock().await;
         s.running = false;
-        s.path1_rtt = 0.0;
-        s.path2_rtt = 0.0;
     }
 }

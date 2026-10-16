@@ -63,6 +63,19 @@ impl RegistryOptimizer {
             warn!("[Registry] Could not open MMCSS SystemProfile key (requires Admin privileges).");
         }
 
+        // 1b. MMCSS Games Task Priority (ExitLag / LagZapper FPS & I/O Boost)
+        let games_task_path = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games";
+        if let Ok(key) = hklm.open_subkey_with_flags(games_task_path, KEY_READ | KEY_WRITE) {
+            self.backup_and_set_dword(&key, games_task_path, "GPU Priority", 8);
+            self.backup_and_set_dword(&key, games_task_path, "Priority", 6);
+        }
+
+        // 1c. Winsock AFD Fast-Path Datagram Threshold (1500 MTU)
+        let afd_path = r"SYSTEM\CurrentControlSet\Services\AFD\Parameters";
+        if let Ok(key) = hklm.open_subkey_with_flags(afd_path, KEY_READ | KEY_WRITE) {
+            self.backup_and_set_dword(&key, afd_path, "FastSendDatagramThreshold", 1500);
+        }
+
         // 2. TCP/IP Network Interfaces tuning
         let interfaces_root_path = r"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces";
         if let Ok(interfaces_key) = hklm.open_subkey_with_flags(interfaces_root_path, KEY_READ) {

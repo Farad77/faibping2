@@ -18,7 +18,8 @@
   "routing": {
     "protocol": "TCP",
     "ports": [6112, 12995, 20481, 20499, "6000-7000", "12000-13500", "20400-20600", "32000-34000"],
-    "target_subnets": ["0.0.0.0/0"]
+    "target_subnets": ["0.0.0.0/0"],
+    "benchmark_endpoint": "170.23.143.92:6112"
   },
   "optimizations": {
     "enable_fastconnect": false,

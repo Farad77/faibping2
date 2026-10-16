@@ -175,9 +175,16 @@ impl MultipathTransport {
                     buf_ch2[HEADER_LEN..len].copy_from_slice(&raw_packet);
                 }
 
-                // Send concurrently on both paths
+                // Send Primary immediately on Path 1 (zero delay)
                 let _ = sock1.send_to(&buf_ch1[..len], dest1).await;
-                let _ = sock2.send_to(&buf_ch2[..len], dest2).await;
+
+                // Micro-stagger Path 2 by 3ms (Temporal Diversity against Wi-Fi/LTE burst drops)
+                let sock2_clone = Arc::clone(&sock2);
+                let dup_payload = buf_ch2[..len].to_vec();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(3)).await;
+                    let _ = sock2_clone.send_to(&dup_payload, dest2).await;
+                });
 
                 {
                     let mut m1 = metrics1.lock().await;

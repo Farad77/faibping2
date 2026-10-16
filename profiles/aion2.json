@@ -22,7 +22,8 @@
       "27015-27030",
       "30000-35000"
     ],
-    "target_subnets": ["0.0.0.0/0"]
+    "target_subnets": ["0.0.0.0/0"],
+    "benchmark_endpoint": "13.232.110.60:443"
   },
   "optimizations": {
     "enable_fastconnect": false,

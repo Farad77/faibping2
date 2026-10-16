@@ -219,9 +219,10 @@ fn load_or_fallback_profile(path: &Path) -> Result<GameProfile, Box<dyn std::err
                         config::PortMatcher::Range(9000, 9100),
                     ],
                     target_subnets: vec!["0.0.0.0/0".into()],
+                    benchmark_endpoint: Some("13.232.110.60:443".into()),
                 },
                 optimizations: config::OptimizationsConfig {
-                    enable_fastconnect: true,
+                    enable_fastconnect: false,
                     enable_multipath_dup: true,
                     packet_duplication_rate: 2,
                     dscp_tag: 46,

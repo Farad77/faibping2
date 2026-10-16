@@ -21,6 +21,8 @@ pub struct RoutingConfig {
     pub protocol: String, // "TCP", "UDP", "BOTH"
     pub ports: Vec<PortMatcher>,
     pub target_subnets: Vec<String>,
+    #[serde(default)]
+    pub benchmark_endpoint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,6 +95,21 @@ impl GameProfile {
         let content = fs::read_to_string(path)?;
         let profile: Self = serde_json::from_str(&content)?;
         Ok(profile)
+    }
+
+    /// Returns the configured benchmark endpoint or a known regional game server fallback
+    pub fn default_benchmark_endpoint(&self) -> String {
+        if let Some(ref ep) = self.routing.benchmark_endpoint {
+            if !ep.is_empty() {
+                return ep.clone();
+            }
+        }
+        match self.game_id.as_str() {
+            "aion2" => "13.232.110.60:443".to_string(),
+            "pathofexile" => "170.23.143.92:6112".to_string(),
+            "farever" => "188.42.43.98:6022".to_string(),
+            _ => "172.65.166.147:20493".to_string(),
+        }
     }
 
     /// Check if a given port matches the routing specification

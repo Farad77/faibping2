@@ -50,6 +50,11 @@ impl TunnelNat {
         // Rewrite source IP to virtual tunnel IP
         packet[12..16].copy_from_slice(&self.virtual_ip);
 
+        // Clamp TCP MSS on SYN packets to 1360 bytes to avoid IP fragmentation over UDP tunnel
+        if proto == 6 {
+            clamp_tcp_mss(packet, ihl, 1360);
+        }
+
         // Recalculate IP & L4 checksums
         recalculate_checksums(packet)
     }
@@ -80,8 +85,55 @@ impl TunnelNat {
         // Rewrite destination IP to original client IP
         packet[16..20].copy_from_slice(&client_ip);
 
+        // Clamp TCP MSS on SYN-ACK packets to 1360 bytes
+        if proto == 6 {
+            clamp_tcp_mss(packet, ihl, 1360);
+        }
+
         // Recalculate IP & L4 checksums
         recalculate_checksums(packet)
+    }
+}
+
+/// Clamps TCP Maximum Segment Size (Option Kind 2) on SYN / SYN-ACK packets
+fn clamp_tcp_mss(packet: &mut [u8], ihl: usize, max_mss: u16) {
+    if packet.len() < ihl + 20 {
+        return;
+    }
+    let flags = packet[ihl + 13];
+    if (flags & 0x02) == 0 {
+        return; // Not a SYN packet
+    }
+    let data_offset = ((packet[ihl + 12] >> 4) as usize) * 4;
+    if data_offset <= 20 || packet.len() < ihl + data_offset {
+        return;
+    }
+
+    let mut idx = ihl + 20;
+    let end = ihl + data_offset;
+    while idx < end {
+        let kind = packet[idx];
+        if kind == 0 {
+            break; // End of option list
+        } else if kind == 1 {
+            idx += 1; // NOP
+        } else {
+            if idx + 1 >= end {
+                break;
+            }
+            let len = packet[idx + 1] as usize;
+            if len < 2 || idx + len > end {
+                break;
+            }
+            if kind == 2 && len == 4 {
+                let current_mss = u16::from_be_bytes([packet[idx + 2], packet[idx + 3]]);
+                if current_mss > max_mss {
+                    packet[idx + 2..idx + 4].copy_from_slice(&max_mss.to_be_bytes());
+                }
+                break;
+            }
+            idx += len;
+        }
     }
 }
 
@@ -93,19 +145,24 @@ mod tests {
     fn test_tunnel_nat_roundtrip() {
         let nat = TunnelNat::new([10, 8, 0, 2]);
 
-        // 1. Client creates outbound TCP packet
-        let mut pkt = vec![0u8; 40];
+        // 1. Client creates outbound TCP SYN packet with MSS=1460
+        let mut pkt = vec![0u8; 44];
         pkt[0] = 0x45;
+        pkt[2..4].copy_from_slice(&44u16.to_be_bytes());
         pkt[9] = 6; // TCP
         pkt[12..16].copy_from_slice(&[192, 168, 1, 229]); // Client local IP
         pkt[16..20].copy_from_slice(&[188, 42, 43, 98]);  // Game server IP
         pkt[20..22].copy_from_slice(&55000u16.to_be_bytes()); // Client port
         pkt[22..24].copy_from_slice(&6112u16.to_be_bytes());  // Server port
-        pkt[32] = 0x50;
+        pkt[32] = 0x60; // Data offset 6 (24 bytes TCP header)
+        pkt[33] = 0x02; // SYN flag
+        pkt[40..44].copy_from_slice(&[2, 4, 0x05, 0xB4]); // MSS = 1460
 
         assert!(nat.translate_outbound(&mut pkt));
         // Source IP should now be 10.8.0.2
         assert_eq!(&pkt[12..16], &[10, 8, 0, 2]);
+        // MSS should be clamped to 1360 (0x0550)
+        assert_eq!(&pkt[42..44], &1360u16.to_be_bytes());
 
         // 2. Server replies: src=188.42.43.98:6112, dst=10.8.0.2:55000
         let mut reply = vec![0u8; 40];

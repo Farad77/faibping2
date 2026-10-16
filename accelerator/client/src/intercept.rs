@@ -5,14 +5,17 @@
 //! against the game PID's active ports table. System traffic (Discord, browser, etc.)
 //! passes through untouched.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, watch, Mutex};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::GameProfile;
 use crate::fastconnect::FastConnectEngine;
 use crate::watcher::ProcessState;
+
+/// Local TCP/UDP port used by the Direct Latency Probe so WinDivert always bypasses it.
+pub static DIRECT_PROBE_PORT: AtomicU16 = AtomicU16::new(0);
 
 pub struct InterceptedPacket {
     pub raw: Vec<u8>,
@@ -203,6 +206,7 @@ fn run_divert_loop(
             let inbound_send_raw = send_fn as usize;
             let inbound_rx_clone = Arc::clone(&_inbound_rx);
             let last_addr_inbound = Arc::clone(&last_addr);
+            let handle_slot_inbound = Arc::clone(&handle_slot);
 
             std::thread::spawn(move || {
                 let inbound_handle = inbound_handle_raw as *mut std::ffi::c_void;
@@ -214,6 +218,9 @@ fn run_divert_loop(
                         rx.blocking_recv()
                     };
                     if let Some(mut pkt) = pkt_opt {
+                        if handle_slot_inbound.load(Ordering::SeqCst) == 0 {
+                            break;
+                        }
                         let mut inbound_addr = *last_addr_inbound.lock().unwrap();
                         inbound_addr[10] &= !0x02; // Set Inbound direction (clear Outbound bit 17)
 
@@ -232,10 +239,14 @@ fn run_divert_loop(
                             inbound_addr.as_ptr(),
                         );
                         if ok == 0 {
-                            let err = windows_sys::Win32::Foundation::GetLastError();
-                            error!("[WinDivert] Failed to inject return packet into Windows stack: error {}", err);
+                            if handle_slot_inbound.load(Ordering::SeqCst) != 0 {
+                                let err = windows_sys::Win32::Foundation::GetLastError();
+                                error!("[WinDivert] Failed to inject return packet into Windows stack: error {}", err);
+                            } else {
+                                break;
+                            }
                         } else {
-                            info!("[WinDivert] Successfully injected return packet into Windows stack ({} bytes)", pkt.len());
+                            debug!("[WinDivert] Injected return packet ({} bytes)", pkt.len());
                         }
                     } else {
                         break;
@@ -265,11 +276,29 @@ fn run_divert_loop(
                 let packet = &packet_buf[..read_len as usize];
                 if let Some((is_tcp, src_port, dst_port)) = parse_l4_ports(packet) {
                     let state = state_rx.borrow().clone();
-                    // Web authentication, CDN downloads, and DNS must never be intercepted
-                    let is_web_traffic = dst_port == 443 || dst_port == 80 || dst_port == 53;
-                    let matches_game = !is_web_traffic
-                        && (state.tracked_ports.contains(&src_port) || state.is_running)
-                        && profile.matches_port(dst_port);
+                    // Web authentication, CDN downloads, DNS, and our own tunnel/probe sockets must never be intercepted
+                    let is_web_or_tunnel = dst_port == 443
+                        || dst_port == 80
+                        || dst_port == 53
+                        || dst_port == 51820
+                        || dst_port == 4433;
+                    let is_probe_bypass = {
+                        let bp = DIRECT_PROBE_PORT.load(Ordering::Relaxed);
+                        bp != 0 && src_port == bp
+                    };
+                    let is_private_dst = if packet.len() >= 20 {
+                        let d0 = packet[16];
+                        let d1 = packet[17];
+                        d0 == 127 || d0 == 10 || (d0 == 192 && d1 == 168) || (d0 == 172 && (16..=31).contains(&d1))
+                    } else {
+                        false
+                    };
+
+                    let matches_game = !is_web_or_tunnel
+                        && !is_probe_bypass
+                        && !is_private_dst
+                        && (state.tracked_ports.contains(&src_port)
+                            || (state.is_running && profile.matches_port(dst_port)));
 
                     if matches_game {
                         // 1. FastConnect: Synthesize and immediately inject local TCP ACK into Windows stack
